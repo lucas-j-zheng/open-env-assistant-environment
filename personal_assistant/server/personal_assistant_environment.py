@@ -60,8 +60,7 @@ class PersonalAssistantEnvironment(Environment):
         self._events: list[dict] = []
         self._notifications: list[str] = []
         self._found: set[str] = set()
-        self._conflicts_resolved = False
-        self._old_meeting_cancelled = False
+        self._had_initial_conflicts = False
         self._state = CalendarState(
             episode_id=str(uuid4()),
             step_count=0,
@@ -113,7 +112,6 @@ class PersonalAssistantEnvironment(Environment):
             "attendees": [a.strip() for a in attendees.split(",") if a.strip()],
         }
         self._events.append(event)
-        self._check_completions()
         return f"Event '{title}' created on {target} from {start_time} to {end_time}."
 
     def tool_delete_event(self, title: str) -> str:
@@ -123,9 +121,6 @@ class PersonalAssistantEnvironment(Environment):
             return f"No event found with title '{title}'."
         for m in matches:
             self._events.remove(m)
-        if "old project review" in title.lower():
-            self._old_meeting_cancelled = True
-            self._check_completions()
         return f"Deleted event '{title}'."
 
     def tool_find_free_slots(self, date: str = "today", duration_minutes: int = 60) -> str:
@@ -181,8 +176,6 @@ class PersonalAssistantEnvironment(Environment):
         end_dt = start_dt + timedelta(minutes=event["duration_minutes"])
         event["start_time"] = new_start_time
         event["end_time"] = end_dt.strftime("%H:%M")
-        self._conflicts_resolved = True
-        self._check_completions()
         return f"Moved '{event_title}' to {new_start_time}-{event['end_time']}."
 
     def tool_send_notification(self, to: str, message: str) -> str:
@@ -222,31 +215,57 @@ class PersonalAssistantEnvironment(Environment):
         except TypeError as e:
             return f"Error calling {tool_name}: {e}"
 
-    # --- Completion checking ---
+    # --- Completion checking (outcome-based) ---
 
     def _check_completions(self):
-        # standup_scheduled
+        # standup_scheduled: a standup event exists tomorrow at 09:00
+        tomorrow = self._resolve_date("tomorrow")
         if any(
             "standup" in e.get("title", "").lower()
-            and "09:00" in e.get("start_time", "")
+            and e.get("date") == tomorrow
+            and e.get("start_time") == "09:00"
             for e in self._events
         ):
             self._found.add("standup_scheduled")
 
-        # focus_time_booked
-        if any("focus" in e.get("title", "").lower() for e in self._events):
+        # focus_time_booked: a focus event exists today
+        today = self._resolve_date("today")
+        if any(
+            "focus" in e.get("title", "").lower()
+            and e.get("date") == today
+            for e in self._events
+        ):
             self._found.add("focus_time_booked")
 
-        # conflicts_resolved
-        if self._conflicts_resolved:
+        # conflicts_resolved: no overlapping events today
+        today_events = sorted(
+            [e for e in self._events if e["date"] == today],
+            key=lambda x: x["start_time"],
+        )
+        has_conflicts = False
+        for i in range(len(today_events) - 1):
+            if today_events[i]["end_time"] > today_events[i + 1]["start_time"]:
+                has_conflicts = True
+                break
+        # Only mark resolved if there were initial conflicts (seeded)
+        if not has_conflicts and self._had_initial_conflicts:
             self._found.add("conflicts_resolved")
 
-        # reminder_set
-        if any("dentist" in e.get("title", "").lower() for e in self._events):
+        # reminder_set: a dentist event exists next monday at 14:00
+        next_mon = self._resolve_date("next monday")
+        if any(
+            "dentist" in e.get("title", "").lower()
+            and e.get("date") == next_mon
+            and e.get("start_time") == "14:00"
+            for e in self._events
+        ):
             self._found.add("reminder_set")
 
-        # meeting_cancelled
-        if self._old_meeting_cancelled:
+        # meeting_cancelled: "Old Project Review" no longer exists
+        if not any(
+            "old project review" in e.get("title", "").lower()
+            for e in self._events
+        ):
             self._found.add("meeting_cancelled")
 
     # --- Seed data ---
@@ -296,8 +315,7 @@ class PersonalAssistantEnvironment(Environment):
 
     def reset(self, **kwargs) -> CalendarObservation:
         self._found = set()
-        self._conflicts_resolved = False
-        self._old_meeting_cancelled = False
+        self._had_initial_conflicts = False
         self._notifications = []
         self._state = CalendarState(
             episode_id=str(uuid4()),
@@ -305,6 +323,7 @@ class PersonalAssistantEnvironment(Environment):
             total_tasks=len(self.TASKS),
         )
         self._seed_initial_events()
+        self._had_initial_conflicts = True  # seed data has a conflict
 
         return CalendarObservation(
             output=(
@@ -336,6 +355,7 @@ class PersonalAssistantEnvironment(Environment):
 
         if tool_name:
             output = self._dispatch_tool(tool_name, arguments)
+            self._check_completions()
         else:
             # Plain text - show available tools
             output = (
