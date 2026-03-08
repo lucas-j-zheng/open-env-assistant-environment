@@ -34,11 +34,11 @@ class Config:
     max_seq_len: int = 2048
 
     # GRPO (same seed per group — proper GRPO)
-    group_size: int = 4
-    max_steps_per_episode: int = 40  # longer episodes for behavioral divergence
+    group_size: int = 3
+    max_steps_per_episode: int = 40
 
     # Training
-    num_iterations: int = 15
+    num_iterations: int = 10
     lr: float = 5e-5
     max_grad_norm: float = 1.0
     ppo_epochs: int = 1
