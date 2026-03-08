@@ -59,7 +59,6 @@ You are a calendar personal assistant. Respond with a JSON tool call.
 Format: {"tool": "tool_name", "args": {"key": "value"}}
 
 Tools:
-- get_task_list (no args)
 - list_events (date)
 - create_event (title, date, start_time, duration_minutes, attendees, description)
 - delete_event (title)
