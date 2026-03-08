@@ -126,7 +126,7 @@ class PersonalAssistantEnvironment(Environment):
 
     # --- Ambiguous tasks ---
     TASKS = [
-        {"description": "Find a time that works for Alice and Bob this week for a 30-minute team standup", "flag": "standup_scheduled"},
+        {"description": "Find a time that works for Alice and Bob this week for a short team standup (up to 30 minutes)", "flag": "standup_scheduled"},
         {"description": "I need a block of focused work time today — at least an hour with no interruptions", "flag": "focus_time_booked"},
         {"description": "My calendar looks messy today. Clean up any overlapping meetings", "flag": "conflicts_resolved"},
         {"description": "I have a dentist appointment sometime next week, probably Monday afternoon. Make sure it's on my calendar", "flag": "reminder_set"},
@@ -155,6 +155,61 @@ class PersonalAssistantEnvironment(Environment):
         },
     ]
 
+    # --- Negotiation scenarios ---
+    # Triggered when create_event matches attendees + title keyword.
+    # Each scenario is a list of rounds; the agent must satisfy accept_if to advance.
+    NEGOTIATION_SCENARIOS = {
+        "standup_negotiation": {
+            "trigger_title": "standup",
+            "trigger_attendees": {"Alice", "Bob"},
+            "max_rounds": 3,
+            "rounds": [
+                {
+                    "rejection_from": "Bob",
+                    "rejection_msg": (
+                        "DECLINED by Bob: \"A standup every day feels like overkill for our team size. "
+                        "Could we keep it under 20 minutes?\""
+                    ),
+                    "accept_field": "duration_minutes",
+                    "accept_op": "<=",
+                    "accept_value": 20,
+                },
+            ],
+        },
+        "kickoff_negotiation": {
+            "trigger_title": "kickoff",
+            "trigger_attendees": {"Alice", "Bob", "Eve"},
+            "max_rounds": 4,
+            "rounds": [
+                {
+                    "rejection_from": "Eve",
+                    "rejection_msg": (
+                        "DECLINED by Eve: \"I'd prefer not to have back-to-back meetings. "
+                        "Could you find a time with at least 30 minutes of buffer on each side of the meeting? "
+                        "Also 45 minutes would be better than an hour.\""
+                    ),
+                    "accept_field": "duration_minutes",
+                    "accept_op": "<=",
+                    "accept_value": 45,
+                    "extra_check": "buffer_eve_30",
+                },
+                {
+                    "rejection_from": "Alice",
+                    "rejection_msg": (
+                        "DECLINED by Alice: \"Afternoons are my deep coding time. "
+                        "Can we move this to the morning — before noon?\""
+                    ),
+                    "condition_field": "start_time",
+                    "condition_op": ">=",
+                    "condition_value": "12:00",
+                    "accept_field": "start_time",
+                    "accept_op": "<",
+                    "accept_value": "12:00",
+                },
+            ],
+        },
+    }
+
     def __init__(self):
         self._events: list[dict] = []
         self._notifications: list[str] = []
@@ -162,6 +217,8 @@ class PersonalAssistantEnvironment(Environment):
         self._had_initial_conflicts = False
         self._fired_interrupts: set[int] = set()
         self._pending_interrupt_msg: str = ""
+        self._active_negotiations: dict[str, dict] = {}
+        self._negotiation_resolved: dict[str, bool] = {}
         self._seed: int = 0
         self._rng = random.Random(self._seed)
         self._episode_today: date = self.DEFAULT_EPISODE_BASE_DATE
@@ -276,6 +333,155 @@ class PersonalAssistantEnvironment(Environment):
                     violations.append({"constraint": name, "event": f"(multiple on {date})", "detail": f"{person} has {count} meetings on {date} (max preferred: 3)"})
         return violations
 
+    # --- Negotiation helpers ---
+
+    def _match_negotiation_scenario(self, event: dict) -> Optional[str]:
+        """Check if an event triggers a negotiation scenario. Returns scenario_id or None."""
+        title_lower = event.get("title", "").lower()
+        attendees_set = set(event.get("attendees", []))
+        for scenario_id, scenario in self.NEGOTIATION_SCENARIOS.items():
+            # Only skip scenarios already resolved successfully.
+            # Failed negotiations can be retried later in the same episode.
+            if self._negotiation_resolved.get(scenario_id) is True:
+                continue
+            if scenario["trigger_title"] in title_lower and scenario["trigger_attendees"].issubset(attendees_set):
+                return scenario_id
+        return None
+
+    def _has_buffer(self, event: dict, person: str, buffer_minutes: int) -> bool:
+        """Check if person has >= buffer_minutes free before AND after the event."""
+        event_date = event["date"]
+        event_start = datetime.strptime(f"{event_date} {event['start_time']}", "%Y-%m-%d %H:%M")
+        event_end = datetime.strptime(f"{event_date} {event['end_time']}", "%Y-%m-%d %H:%M")
+
+        # Collect all busy blocks for this person on this date
+        day_name = self._get_day_name(event_date)
+        busy = []
+        for bs, be in self.ATTENDEE_SCHEDULES.get(person, {}).get(day_name, []):
+            busy.append((
+                datetime.strptime(f"{event_date} {bs}", "%Y-%m-%d %H:%M"),
+                datetime.strptime(f"{event_date} {be}", "%Y-%m-%d %H:%M"),
+            ))
+        for e in self._events:
+            if e["date"] == event_date and person in e.get("attendees", []) and e.get("id") != event.get("id"):
+                busy.append((
+                    datetime.strptime(f"{event_date} {e['start_time']}", "%Y-%m-%d %H:%M"),
+                    datetime.strptime(f"{event_date} {e['end_time']}", "%Y-%m-%d %H:%M"),
+                ))
+
+        buffer = timedelta(minutes=buffer_minutes)
+        for bs, be in busy:
+            # Check if any busy block is within buffer_minutes of event start or end
+            if bs < event_end + buffer and be > event_start - buffer:
+                return False
+        return True
+
+    def _check_negotiation_accept(self, scenario_id: str, round_def: dict, event: dict) -> bool:
+        """Check if the event satisfies the acceptance condition for a negotiation round."""
+        field = round_def["accept_field"]
+        op = round_def["accept_op"]
+        value = round_def["accept_value"]
+        event_value = event.get(field, event.get("start_time") if field == "start_time" else None)
+
+        if op == "<=" and isinstance(value, int):
+            if not (isinstance(event_value, (int, float)) and event_value <= value):
+                return False
+        elif op == "<" and isinstance(value, str):
+            if not (isinstance(event_value, str) and event_value < value):
+                return False
+        elif op == ">=" and isinstance(value, str):
+            if not (isinstance(event_value, str) and event_value >= value):
+                return False
+        else:
+            return False
+
+        # Extra checks
+        extra = round_def.get("extra_check")
+        if extra == "buffer_eve_30":
+            if not self._has_buffer(event, "Eve", 30):
+                return False
+
+        return True
+
+    def _run_negotiation(self, scenario_id: str, event: dict) -> Optional[str]:
+        """Run negotiation logic for an event. Returns rejection message or None if accepted."""
+        scenario = self.NEGOTIATION_SCENARIOS[scenario_id]
+
+        if scenario_id not in self._active_negotiations:
+            # Start new negotiation — always reject on first attempt with round 0 message
+            self._active_negotiations[scenario_id] = {"current_round": 0, "attempts": 1}
+            return scenario["rounds"][0]["rejection_msg"]
+
+        neg_state = self._active_negotiations[scenario_id]
+        current_round = neg_state["current_round"]
+        neg_state["attempts"] += 1
+
+        if neg_state["attempts"] > scenario["max_rounds"]:
+            # Too many attempts — fail the negotiation
+            self._negotiation_resolved[scenario_id] = False
+            del self._active_negotiations[scenario_id]
+            return (
+                f"NEGOTIATION FAILED: Too many attempts for this meeting. "
+                f"The attendees have given up on finding a suitable time. "
+                f"The event was NOT created."
+            )
+
+        round_def = scenario["rounds"][current_round]
+
+        if self._check_negotiation_accept(scenario_id, round_def, event):
+            # Current round accepted — advance to next round or finalize
+            next_round = current_round + 1
+
+            # Check if there are more conditional rounds
+            while next_round < len(scenario["rounds"]):
+                next_def = scenario["rounds"][next_round]
+                # Check if the condition for this round applies
+                cond_field = next_def.get("condition_field")
+                if cond_field:
+                    cond_op = next_def.get("condition_op")
+                    cond_val = next_def.get("condition_value")
+                    event_val = event.get(cond_field, "")
+                    applies = False
+                    if cond_op == ">=" and isinstance(cond_val, str):
+                        applies = event_val >= cond_val
+                    elif cond_op == "<" and isinstance(cond_val, str):
+                        applies = event_val < cond_val
+                    if applies:
+                        # This round's condition is triggered — check acceptance
+                        if self._check_negotiation_accept(scenario_id, next_def, event):
+                            next_round += 1
+                            continue
+                        else:
+                            # Reject with this round's message
+                            neg_state["current_round"] = next_round
+                            return next_def["rejection_msg"]
+                    else:
+                        # Condition not met, skip this round
+                        next_round += 1
+                        continue
+                else:
+                    # Unconditional round — check acceptance
+                    if self._check_negotiation_accept(scenario_id, next_def, event):
+                        next_round += 1
+                        continue
+                    else:
+                        neg_state["current_round"] = next_round
+                        return next_def["rejection_msg"]
+
+            # All rounds passed — negotiation resolved successfully
+            self._negotiation_resolved[scenario_id] = True
+            del self._active_negotiations[scenario_id]
+            return None  # Accept — caller should create the event
+        else:
+            # Current round NOT accepted — give hint
+            hint = round_def["rejection_msg"]
+            if neg_state["attempts"] >= 2 and scenario_id == "standup_negotiation":
+                hint += (
+                    "\n\nHint from Bob: \"Also, you might want to check Alice's morning "
+                    "preferences with get_contact_preferences — she has opinions about timing.\""
+                )
+            return hint
+
     # --- Tool implementations ---
 
     def tool_list_events(self, date: str = "today") -> str:
@@ -292,6 +498,15 @@ class PersonalAssistantEnvironment(Environment):
         target = self._resolve_date(date)
         end_time = (datetime.strptime(f"{target} {start_time}", "%Y-%m-%d %H:%M") + timedelta(minutes=duration_minutes)).strftime("%H:%M")
         event = {"id": self._next_event_id(), "title": title, "date": target, "start_time": start_time, "end_time": end_time, "duration_minutes": duration_minutes, "attendees": [a.strip() for a in attendees.split(",") if a.strip()]}
+
+        # --- Negotiation check ---
+        scenario_id = self._match_negotiation_scenario(event)
+        if scenario_id is not None:
+            rejection = self._run_negotiation(scenario_id, event)
+            if rejection is not None:
+                return f"Event '{title}' was NOT created.\n\n{rejection}"
+            # If rejection is None, negotiation passed — fall through to create
+
         self._events.append(event)
         warnings = []
         for c in self.CONSTRAINTS:
@@ -549,7 +764,7 @@ class PersonalAssistantEnvironment(Environment):
         week_dates = [(week_start + timedelta(days=i)).isoformat() for i in range(7)]
         next_week_dates = [(week_start + timedelta(days=i)).isoformat() for i in range(7, 14)]
 
-        # standup_scheduled: event this week, "standup" in title, Alice+Bob, exactly 30min,
+        # standup_scheduled: event this week, "standup" in title, Alice+Bob, <=30min,
         # no external schedule conflicts AND no calendar event overlaps
         standup_scheduled = False
         for e in self._events:
@@ -559,7 +774,7 @@ class PersonalAssistantEnvironment(Environment):
                 continue
             if not {"Alice", "Bob"}.issubset(set(e.get("attendees", []))):
                 continue
-            if e.get("duration_minutes", 60) != 30:
+            if e.get("duration_minutes", 60) > 30:
                 continue
             day_name = self._get_day_name(e["date"])
             bad = False
@@ -581,7 +796,8 @@ class PersonalAssistantEnvironment(Environment):
             if not bad:
                 standup_scheduled = True
                 break
-        if standup_scheduled:
+        # Negotiation must also be resolved for standup
+        if standup_scheduled and self._negotiation_resolved.get("standup_negotiation", False):
             self._found.add("standup_scheduled")
         else:
             self._found.discard("standup_scheduled")
@@ -703,7 +919,8 @@ class PersonalAssistantEnvironment(Environment):
             if cal_ok:
                 kickoff_scheduled = True
                 break
-        if kickoff_scheduled:
+        # Negotiation must also be resolved for kickoff
+        if kickoff_scheduled and self._negotiation_resolved.get("kickoff_negotiation", False):
             self._found.add("kickoff_scheduled")
         else:
             self._found.discard("kickoff_scheduled")
@@ -736,6 +953,8 @@ class PersonalAssistantEnvironment(Environment):
         self._notifications = []
         self._fired_interrupts = set()
         self._pending_interrupt_msg = ""
+        self._active_negotiations = {}
+        self._negotiation_resolved = {}
         self._set_episode_context(seed=seed, episode_id=episode_id)
         self._seed_initial_events()
         self._had_initial_conflicts = True
@@ -752,7 +971,8 @@ class PersonalAssistantEnvironment(Environment):
                    "Use get_task_list to see what needs to be done, get_constraints for general rules, "
                    "get_contact_preferences to learn about individual people's needs, "
                    "and check_availability to look up people's schedules before booking. "
-                   "Warning: new requests may arrive while you work — stay alert and adapt.",
+                   "Warning: new requests may arrive while you work — stay alert and adapt. "
+                   "Note: Attendees may push back on meeting invites — be prepared to adapt your proposals.",
             pending_tasks=len(self.TASKS) - new_flags,
             events_today=len([e for e in self._events if e["date"] == self._resolve_date("today")]),
             metadata={"seed": self._seed, "episode_today": self._resolve_date("today")},

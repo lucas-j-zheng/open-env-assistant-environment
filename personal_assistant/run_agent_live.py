@@ -264,7 +264,8 @@ IMPORTANT workflow:
 5. After making changes, call check_constraint_violations to catch any violations.
 6. Periodically call get_task_list to check which tasks are still TODO.
 7. The "preferences_optimized" task requires soft constraints to be satisfied. If you see soft violations, fix them.
-8. Think step by step about what tools to call and in what order."""
+8. Think step by step about what tools to call and in what order.
+9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters."""
 
 
 # --- Agent Logic ---
