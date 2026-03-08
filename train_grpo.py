@@ -33,13 +33,12 @@ class Config:
     lora_alpha: int = 32
     max_seq_len: int = 2048
 
-    # GRPO
-    group_size: int = 4           # each on different seed for reward variance
-    seeds_per_iter: int = 1       # not used anymore
-    max_steps_per_episode: int = 20
+    # GRPO (same seed per group — proper GRPO)
+    group_size: int = 4
+    max_steps_per_episode: int = 40  # longer episodes for behavioral divergence
 
     # Training
-    num_iterations: int = 30
+    num_iterations: int = 15
     lr: float = 5e-5
     max_grad_norm: float = 1.0
     ppo_epochs: int = 1
@@ -238,9 +237,8 @@ def main():
         [p for p in model.parameters() if p.requires_grad], lr=cfg.lr
     )
 
-    eps_per_iter = cfg.group_size * cfg.seeds_per_iter
-    print(f"Training: {cfg.num_iterations} iters x {eps_per_iter} episodes/iter")
-    print(f"Group size: {cfg.group_size}, Seeds/iter: {cfg.seeds_per_iter}\n")
+    print(f"Training: {cfg.num_iterations} iters x {cfg.group_size} episodes/iter (same seed)")
+    print(f"Group size: {cfg.group_size}, Max steps: {cfg.max_steps_per_episode}\n")
 
     best_reward = 0.0
     reward_log = []
@@ -250,17 +248,27 @@ def main():
     for it in range(1, cfg.num_iterations + 1):
         t0 = time.time()
 
-        # Phase 1: Rollout (different seed per episode for reward variance)
+        # Phase 1: Rollout — same seed (proper GRPO), fallback to mixed seeds
         FastLanguageModel.for_inference(model)
+        seed = random.randint(0, 100_000)
         group_rewards, group_trajs = [], []
 
         for _ in range(cfg.group_size):
-            seed = random.randint(0, 100_000)
             r, traj, n_steps = run_episode(model, tokenizer, seed, cfg, device)
             group_rewards.append(r)
             group_trajs.append(traj)
 
-        # GRPO advantages (normalized across different-seed episodes)
+        # If zero variance (all same reward), retry with different seeds
+        if np.std(group_rewards) < 1e-6:
+            print(f"    (same-seed gave identical rewards {group_rewards[0]:.3f}, retrying mixed seeds)")
+            group_rewards, group_trajs = [], []
+            for _ in range(cfg.group_size):
+                seed = random.randint(0, 100_000)
+                r, traj, n_steps = run_episode(model, tokenizer, seed, cfg, device)
+                group_rewards.append(r)
+                group_trajs.append(traj)
+
+        # GRPO advantages
         mu = np.mean(group_rewards)
         sigma = np.std(group_rewards) + 1e-8
         advs = [(r - mu) / sigma for r in group_rewards]
