@@ -34,12 +34,12 @@ class Config:
     max_seq_len: int = 2048
 
     # GRPO
-    group_size: int = 4           # need >=4 for reward variance
-    seeds_per_iter: int = 1       # 1 seed, 4 episodes per iter
-    max_steps_per_episode: int = 20  # shorter to compensate
+    group_size: int = 4           # each on different seed for reward variance
+    seeds_per_iter: int = 1       # not used anymore
+    max_steps_per_episode: int = 20
 
     # Training
-    num_iterations: int = 20
+    num_iterations: int = 30
     lr: float = 5e-5
     max_grad_norm: float = 1.0
     ppo_epochs: int = 1
@@ -250,30 +250,28 @@ def main():
     for it in range(1, cfg.num_iterations + 1):
         t0 = time.time()
 
-        # Phase 1: Rollout
+        # Phase 1: Rollout (different seed per episode for reward variance)
         FastLanguageModel.for_inference(model)
-        rollout_data = []
+        group_rewards, group_trajs = [], []
 
-        for _ in range(cfg.seeds_per_iter):
+        for _ in range(cfg.group_size):
             seed = random.randint(0, 100_000)
-            group_rewards, group_trajs = [], []
+            r, traj, n_steps = run_episode(model, tokenizer, seed, cfg, device)
+            group_rewards.append(r)
+            group_trajs.append(traj)
 
-            for _ in range(cfg.group_size):
-                r, traj, n_steps = run_episode(model, tokenizer, seed, cfg, device)
-                group_rewards.append(r)
-                group_trajs.append(traj)
+        # GRPO advantages (normalized across different-seed episodes)
+        mu = np.mean(group_rewards)
+        sigma = np.std(group_rewards) + 1e-8
+        advs = [(r - mu) / sigma for r in group_rewards]
 
-            # GRPO advantages (normalized within group)
-            mu = np.mean(group_rewards)
-            sigma = np.std(group_rewards) + 1e-8
-            advs = [(r - mu) / sigma for r in group_rewards]
-
-            for g in range(cfg.group_size):
-                rollout_data.append({
-                    "trajectory": group_trajs[g],
-                    "advantage": advs[g],
-                    "reward": group_rewards[g],
-                })
+        rollout_data = []
+        for g in range(cfg.group_size):
+            rollout_data.append({
+                "trajectory": group_trajs[g],
+                "advantage": advs[g],
+                "reward": group_rewards[g],
+            })
 
         all_rewards = [d["reward"] for d in rollout_data]
         avg_r = np.mean(all_rewards)
