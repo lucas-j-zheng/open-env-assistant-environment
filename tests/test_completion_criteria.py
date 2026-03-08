@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,20 @@ def _step(env: PersonalAssistantEnvironment, tool: str | None = None, args: dict
     if instruction is None:
         instruction = json.dumps({"tool": tool, "args": args or {}})
     return env.step(CalendarAction(instruction=instruction))
+
+
+def _first_free_start(env: PersonalAssistantEnvironment, target_date: str, duration_minutes: int) -> str:
+    day_events = sorted([e for e in env._events if e["date"] == target_date], key=lambda x: x["start_time"])
+    current = datetime.strptime(f"{target_date} 08:00", "%Y-%m-%d %H:%M")
+    end_of_day = datetime.strptime(f"{target_date} 18:00", "%Y-%m-%d %H:%M")
+    for event in day_events:
+        event_start = datetime.strptime(f"{target_date} {event['start_time']}", "%Y-%m-%d %H:%M")
+        if (event_start - current).total_seconds() / 60 >= duration_minutes:
+            return current.strftime("%H:%M")
+        current = max(current, datetime.strptime(f"{target_date} {event['end_time']}", "%Y-%m-%d %H:%M"))
+    if (end_of_day - current).total_seconds() / 60 >= duration_minutes:
+        return current.strftime("%H:%M")
+    raise AssertionError(f"No free slot of {duration_minutes} minutes found on {target_date}")
 
 
 def test_standup_requires_this_week_negotiation_and_is_revocable():
@@ -71,6 +86,8 @@ def test_standup_requires_this_week_negotiation_and_is_revocable():
 def test_reward_decreases_when_focus_time_becomes_invalid():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
+    today = env._resolve_date("today")
+    start_time = _first_free_start(env, today, 60)
 
     obs = _step(
         env,
@@ -78,7 +95,7 @@ def test_reward_decreases_when_focus_time_becomes_invalid():
         args={
             "title": "Focus Time",
             "date": "today",
-            "start_time": "16:00",
+            "start_time": start_time,
             "duration_minutes": 60,
             "attendees": "",
         },
@@ -87,12 +104,17 @@ def test_reward_decreases_when_focus_time_becomes_invalid():
     reward_before = obs.reward
 
     # Move focus block into an overlap so completion and reward drop.
+    focus_event = next(e for e in env._events if e["title"] == "Focus Time")
+    overlap_target = next(
+        e for e in env._events
+        if e.get("id") != focus_event.get("id") and e["date"] == today
+    )
     obs = _step(
         env,
         tool="edit_event",
         args={
             "title": "Focus Time",
-            "new_start_time": "14:45",
+            "new_start_time": overlap_target["start_time"],
         },
     )
     assert "focus_time_booked" not in obs.flags_found
@@ -102,9 +124,13 @@ def test_reward_decreases_when_focus_time_becomes_invalid():
 def test_interrupts_can_revoke_flags_on_non_tool_steps():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
+    today = env._resolve_date("today")
+    conflict_title = env._config.cancellable_title
+    conflict_event = next(e for e in env._events if e["title"] == conflict_title)
+    move_to = _first_free_start(env, today, conflict_event["duration_minutes"])
 
     # Resolve initial overlap first.
-    obs = _step(env, tool="resolve_conflict", args={"event_title": "Old Project Review", "new_start_time": "13:00"})
+    obs = _step(env, tool="resolve_conflict", args={"event_title": conflict_title, "new_start_time": move_to})
     assert "conflicts_resolved" in obs.flags_found
 
     # Step 2 with a tool call keeps the flag.
@@ -160,6 +186,22 @@ def test_ceo_sync_accommodated_uses_any_qualifying_ceo_event():
         },
     )
 
-    # Remove overlap so the new 15:00 event qualifies.
-    obs = _step(env, tool="resolve_conflict", args={"event_title": "Design Review", "new_start_time": "15:30"})
+    # Remove all overlaps against the 15:00-15:30 CEO slot so the backup can qualify.
+    today = env._resolve_date("today")
+    target_start, target_end = "15:00", "15:30"
+    for _ in range(8):
+        blockers = [
+            e for e in env._events
+            if e["date"] == today
+            and "ceo" not in e.get("title", "").lower()
+            and e["start_time"] < target_end
+            and e["end_time"] > target_start
+        ]
+        if not blockers:
+            break
+        blocker = blockers[0]
+        move_to = _first_free_start(env, today, blocker["duration_minutes"])
+        _step(env, tool="resolve_conflict", args={"event_title": blocker["title"], "new_start_time": move_to})
+
+    obs = _step(env, tool="get_task_list", args={})
     assert "ceo_sync_accommodated" in obs.flags_found

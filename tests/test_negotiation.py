@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "personal_assistant"))
@@ -20,6 +21,34 @@ def _create(env, title, date, start_time, duration_minutes=60, attendees=""):
         "title": title, "date": date, "start_time": start_time,
         "duration_minutes": duration_minutes, "attendees": attendees,
     })
+
+
+def _find_valid_standup_slot(env: PersonalAssistantEnvironment, duration_minutes: int = 15) -> tuple[str, str]:
+    today = env._episode_today
+    week_start = today - timedelta(days=today.weekday())
+    week_dates = [(week_start + timedelta(days=i)).isoformat() for i in range(7)]
+
+    for target_date in week_dates:
+        day_name = env._get_day_name(target_date)
+        day_events = [e for e in env._events if e["date"] == target_date]
+        for minutes in range(8 * 60, (18 * 60) - duration_minutes + 1, 15):
+            start = f"{minutes // 60:02d}:{minutes % 60:02d}"
+            end_dt = datetime.strptime(f"{target_date} {start}", "%Y-%m-%d %H:%M") + timedelta(minutes=duration_minutes)
+            end = end_dt.strftime("%H:%M")
+
+            # No external conflicts for Alice/Bob
+            if any(start < be and end > bs for bs, be in env.ATTENDEE_SCHEDULES["Alice"].get(day_name, [])):
+                continue
+            if any(start < be and end > bs for bs, be in env.ATTENDEE_SCHEDULES["Bob"].get(day_name, [])):
+                continue
+
+            # No calendar conflicts on target date
+            if any(start < e["end_time"] and end > e["start_time"] for e in day_events):
+                continue
+
+            return target_date, start
+
+    raise AssertionError("No valid standup slot found in this week")
 
 
 # ── Standup negotiation ──────────────────────────────────────────────
@@ -68,8 +97,9 @@ class TestStandupNegotiation:
     def test_sets_flag_after_negotiation(self):
         env = PersonalAssistantEnvironment()
         env.reset(seed=9)
-        _create(env, "Team Standup", "today", "11:00", 60, "Alice,Bob")
-        obs = _create(env, "Team Standup", "today", "11:00", 15, "Alice,Bob")
+        standup_date, standup_start = _find_valid_standup_slot(env, duration_minutes=15)
+        _create(env, "Team Standup", standup_date, standup_start, 60, "Alice,Bob")
+        obs = _create(env, "Team Standup", standup_date, standup_start, 15, "Alice,Bob")
         assert "standup_scheduled" in obs.flags_found
 
     def test_flag_not_set_without_negotiation(self):
