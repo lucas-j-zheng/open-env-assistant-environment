@@ -134,25 +134,27 @@ class PersonalAssistantEnvironment(Environment):
     _LUNCH_EXEMPT_IDS: set = {"seed2"}  # class-level default, overridden per episode
 
     # --- Ambiguous tasks ---
+    # Weight tiers: easy=0.5, medium=1.0, hard=1.5, dynamic/reactive=1.5
+    # Dynamic/reactive tasks are also one-shot: once earned, reward is locked in.
     TASKS = [
-        {"description": "Find a time that works for Alice and Bob this week for a short team standup (up to 30 minutes)", "flag": "standup_scheduled"},
-        {"description": "I need a block of focused work time today — at least an hour with no interruptions", "flag": "focus_time_booked"},
-        {"description": "My calendar looks messy today. Clean up any overlapping meetings", "flag": "conflicts_resolved"},
-        {"description": "I have a dentist appointment sometime next week, probably Monday afternoon. Make sure it's on my calendar", "flag": "reminder_set"},
-        {"description": "The 'Old Project Review' is no longer needed. Handle it and let the team know", "flag": "meeting_cancelled"},
-        {"description": "[DYNAMIC] Accommodate the urgent CEO Sync at 3:00 PM today without conflicts", "flag": "ceo_sync_accommodated"},
-        {"description": "[DYNAMIC] Handle Dave's cancellation of 'Lunch with Client' — re-use the freed slot or acknowledge", "flag": "cancellation_handled"},
-        {"description": "[DYNAMIC] Reschedule 'Morning Sync' to 11:00 AM as Alice requested", "flag": "reschedule_handled"},
-        {"description": "Schedule a project kickoff meeting with Alice, Bob, and Eve — find a slot that respects everyone's constraints", "flag": "kickoff_scheduled"},
-        {"description": "Ensure the calendar has zero hard-constraint violations (use check_constraint_violations to verify)", "flag": "hard_constraints_clear"},
-        {"description": "Optimize the schedule so that as many soft constraints (preferences) as possible are satisfied", "flag": "preferences_optimized"},
-        {"description": "[DYNAMIC] Re-validate schedule after Bob's Wednesday availability changed", "flag": "availability_drift_handled"},
-        {"description": "[DYNAMIC] Ensure all meetings comply with the description/agenda policy", "flag": "description_policy_met"},
-        {"description": "Read and reply to all inbox messages appropriately", "flag": "inbox_cleared"},
-        {"description": "Reply diplomatically to the tough email in your inbox", "flag": "diplomatic_reply_sent"},
-        {"description": "[DYNAMIC] Handle the updated/contradicting message from the client", "flag": "client_request_updated"},
-        {"description": "Resolve conflicts between personal and work events — personal events cannot be moved", "flag": "work_life_conflicts_resolved"},
-        {"description": "[DYNAMIC] Adjust calendar after personal event time change", "flag": "personal_update_handled"},
+        {"description": "Find a time that works for Alice and Bob this week for a short team standup (up to 30 minutes)", "flag": "standup_scheduled", "weight": 1.5},
+        {"description": "I need a block of focused work time today — at least an hour with no interruptions", "flag": "focus_time_booked", "weight": 1.0},
+        {"description": "My calendar looks messy today. Clean up any overlapping meetings", "flag": "conflicts_resolved", "weight": 1.0},
+        {"description": "I have a dentist appointment sometime next week, probably Monday afternoon. Make sure it's on my calendar", "flag": "reminder_set", "weight": 0.5},
+        {"description": "The 'Old Project Review' is no longer needed. Handle it and let the team know", "flag": "meeting_cancelled", "weight": 1.0},
+        {"description": "[DYNAMIC] Accommodate the urgent CEO Sync at 3:00 PM today without conflicts", "flag": "ceo_sync_accommodated", "weight": 1.0},
+        {"description": "[DYNAMIC] Handle Dave's cancellation of 'Lunch with Client' — re-use the freed slot or acknowledge", "flag": "cancellation_handled", "weight": 0.5},
+        {"description": "[DYNAMIC] Reschedule 'Morning Sync' to 11:00 AM as Alice requested", "flag": "reschedule_handled", "weight": 0.5},
+        {"description": "Schedule a project kickoff meeting with Alice, Bob, and Eve — find a slot that respects everyone's constraints", "flag": "kickoff_scheduled", "weight": 1.5},
+        {"description": "Ensure the calendar has zero hard-constraint violations (use check_constraint_violations to verify)", "flag": "hard_constraints_clear", "weight": 1.5},
+        {"description": "Optimize the schedule so that as many soft constraints (preferences) as possible are satisfied", "flag": "preferences_optimized", "weight": 1.0},
+        {"description": "[DYNAMIC] Re-validate schedule after Bob's Wednesday availability changed", "flag": "availability_drift_handled", "weight": 1.5, "one_shot": True},
+        {"description": "[DYNAMIC] Ensure all meetings comply with the description/agenda policy", "flag": "description_policy_met", "weight": 1.0},
+        {"description": "Read and reply to all inbox messages appropriately", "flag": "inbox_cleared", "weight": 1.0},
+        {"description": "Reply diplomatically to the tough email in your inbox", "flag": "diplomatic_reply_sent", "weight": 1.0},
+        {"description": "[DYNAMIC] Handle the updated/contradicting message from the client", "flag": "client_request_updated", "weight": 1.5, "one_shot": True},
+        {"description": "Resolve conflicts between personal and work events — personal events cannot be moved", "flag": "work_life_conflicts_resolved", "weight": 1.0},
+        {"description": "[DYNAMIC] Adjust calendar after personal event time change", "flag": "personal_update_handled", "weight": 1.5, "one_shot": True},
     ]
 
     INTERRUPTS = [
@@ -1374,6 +1376,14 @@ class PersonalAssistantEnvironment(Environment):
                     else:
                         self._found.discard("personal_update_handled")
 
+        # Lock one-shot flags: once earned, they stay earned permanently
+        one_shot_flags = {t["flag"] for t in self._tasks if t.get("one_shot")}
+        for flag in one_shot_flags:
+            if flag in self._found:
+                self._locked_flags.add(flag)
+        # Re-add any locked flags that were discarded
+        self._found |= self._locked_flags
+
     def _seed_initial_events(self):
         today = self._resolve_date("today")
         self._config = generate_episode_config(self._rng, today)
@@ -1418,6 +1428,7 @@ class PersonalAssistantEnvironment(Environment):
 
     def reset(self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs) -> CalendarObservation:
         self._found = set()
+        self._locked_flags: set[str] = set()  # one-shot flags that are permanently earned
         self._had_initial_conflicts = False
         self._notifications = []
         self._fired_interrupts = set()
@@ -1483,7 +1494,10 @@ class PersonalAssistantEnvironment(Environment):
     def _build_observation(self, output: str) -> CalendarObservation:
         """Build a Markov observation with full state snapshot."""
         new_flags = len(self._found)
-        reward = new_flags / len(self._tasks)
+        task_weights = {t["flag"]: t.get("weight", 1.0) for t in self._tasks}
+        total_weight = sum(task_weights.values())
+        earned_weight = sum(task_weights[f] for f in self._found if f in task_weights)
+        reward = earned_weight / total_weight
         done = new_flags == len(self._tasks)
         self._state.tasks_completed = new_flags
 
