@@ -3,8 +3,10 @@
 import asyncio
 import json
 import os
+import random
 import threading
 import time
+from datetime import date, timedelta
 from typing import List
 
 from dotenv import load_dotenv
@@ -16,9 +18,11 @@ import websockets
 
 load_dotenv()
 
-SERVER_URL = "http://localhost:8000"
 WS_URL = "ws://localhost:8000/ws"
-MODEL = "Qwen/Qwen2.5-72B-Instruct"
+MODEL = "llama-3.3-70b-versatile"
+AGENT_SEED = int(os.getenv("AGENT_SEED", "7"))
+EPISODE_BASE_DATE = date(2026, 1, 5)  # Keep in sync with environment.
+EPISODE_WEEKS = 3  # Keep in sync with environment.
 
 # --- Dashboard Server ---
 
@@ -106,6 +110,25 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "edit_event",
+            "description": "Edit an existing event. Only provided fields are changed. Use empty string or 0 to keep current value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Current title of the event to edit"},
+                    "new_title": {"type": "string", "description": "New title (optional)"},
+                    "new_date": {"type": "string", "description": "New date (optional)"},
+                    "new_start_time": {"type": "string", "description": "New start time HH:MM (optional)"},
+                    "new_duration_minutes": {"type": "integer", "description": "New duration in minutes (optional)"},
+                    "new_attendees": {"type": "string", "description": "New comma-separated attendees list — replaces all current attendees (optional)"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_free_slots",
             "description": "Find available time slots on a given date (8:00-18:00).",
             "parameters": {
@@ -174,48 +197,161 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_availability",
+            "description": "Check a person's availability on a given date. Shows their busy times from external commitments and free windows.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "person": {"type": "string", "description": "Person's name (e.g. Alice, Bob, Charlie, Dave, Eve)"},
+                    "date": {"type": "string", "description": "Date: 'today', 'tomorrow', day name like 'tuesday', 'next wednesday', or YYYY-MM-DD", "default": "today"},
+                },
+                "required": ["person"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_constraints",
+            "description": "Get scheduling constraints (hard and soft) that apply to the calendar. Note: individual people may have additional private constraints — use get_contact_preferences to discover them.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_contact_preferences",
+            "description": "Get a person's scheduling preferences, private constraints, role, and preferred notification method. Some constraints are only visible through this tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "person": {"type": "string", "description": "Person's name (e.g. Alice, Bob, Charlie, Dave, Eve)"},
+                },
+                "required": ["person"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_constraint_violations",
+            "description": "Check the current calendar for all constraint violations.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """You are a calendar personal assistant. You have access to tools to manage a calendar.
 
 Your goal is to complete ALL tasks on the task list. Start by calling get_task_list to see what needs to be done, then use the available tools to complete each task.
 
-Think step by step about what tools to call and in what order. After completing actions, check the task list again to verify progress."""
+IMPORTANT workflow:
+1. First call get_task_list and get_constraints to understand the general rules.
+2. BEFORE scheduling any meeting with someone, call get_contact_preferences(person) to discover their private constraints and preferences. Not all constraints are visible in get_constraints.
+3. Use check_availability before scheduling — don't guess times.
+4. When scheduling, respect HARD constraints (must obey) and SOFT constraints (preferences).
+5. After making changes, call check_constraint_violations to catch any violations.
+6. Periodically call get_task_list to check which tasks are still TODO.
+7. The "preferences_optimized" task requires soft constraints to be satisfied. If you see soft violations, fix them.
+8. Think step by step about what tools to call and in what order."""
 
 
 # --- Agent Logic ---
 
+
+def _seed_to_episode_today(seed: int) -> str:
+    rng = random.Random(seed)
+    weekdays = []
+    for week in range(EPISODE_WEEKS):
+        for day in range(5):
+            weekdays.append(EPISODE_BASE_DATE + timedelta(weeks=week, days=day))
+    return rng.choice(weekdays).isoformat()
+
+
+def _extract_interrupt(step: int, output: str) -> dict | None:
+    if "--- INTERRUPT ---" not in output:
+        return None
+
+    interrupt_text = output.split("--- INTERRUPT ---", 1)[1].strip()
+    if step == 3 or "CEO" in interrupt_text:
+        key = "ceo_sync"
+    elif step == 6 or "Lunch with Client" in interrupt_text:
+        key = "lunch_cancellation"
+    elif step == 9 or "Morning Sync" in interrupt_text:
+        key = "morning_reschedule"
+    else:
+        key = f"interrupt_step_{step}"
+
+    return {"key": key, "message": interrupt_text}
+
+
 async def _fetch_final_calendar(ws):
-    """Fetch today's and tomorrow's calendar after agent finishes."""
+    """Fetch calendar for this week and next week (all weekdays)."""
+    episode_today = _seed_to_episode_today(AGENT_SEED)
+    today_dt = date.fromisoformat(episode_today)
+    days_since_mon = today_dt.weekday()
+    week_start = today_dt - timedelta(days=days_since_mon)
+
+    dates_to_check = []
+    for week in range(2):
+        for day in range(5):  # Mon-Fri
+            d = week_start + timedelta(weeks=week, days=day)
+            dates_to_check.append(d.isoformat())
+
     results = []
-    for date in ["today", "tomorrow", "next monday"]:
-        action = {"type": "step", "data": {"instruction": json.dumps({"tool": "list_events", "args": {"date": date}})}}
+    for d in dates_to_check:
+        action = {"type": "step", "data": {"instruction": json.dumps({"tool": "list_events", "args": {"date": d}})}}
         await ws.send(json.dumps(action))
         resp = json.loads(await ws.recv())
         output = resp["data"]["observation"]["output"]
-        results.append(output)
-    return "\n\n".join(results)
+        if "No events" not in output:
+            results.append(output)
+    return "\n\n".join(results) if results else "No events on any day."
 
 
 async def run_agent():
-    # Wait for dashboard to be ready
+    # Wait for a browser client to connect before starting
+    print("Waiting for a browser client to connect to the dashboard...")
+    while not dashboard_clients:
+        await asyncio.sleep(0.5)
+    print("Browser connected! Starting agent in 2 seconds...")
     await asyncio.sleep(2)
 
     client = OpenAI(
-        base_url="https://router.huggingface.co/v1",
-        api_key=os.getenv("HF_TOKEN"),
+        base_url="https://api.groq.com/openai/v1",
+        api_key=os.getenv("GROQ_API_KEY"),
     )
 
     async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=120) as ws:
         # Reset
-        await ws.send(json.dumps({"type": "reset"}))
+        await ws.send(json.dumps({"type": "reset", "data": {"seed": AGENT_SEED}}))
         reset_resp = json.loads(await ws.recv())
         obs = reset_resp["data"]["observation"]
+        await ws.send(json.dumps({"type": "state"}))
+        state_resp = json.loads(await ws.recv())
+        episode_id = state_resp.get("data", {}).get("episode_id", "unknown")
+        episode_today = _seed_to_episode_today(AGENT_SEED)
 
         await broadcast({
             "type": "reset",
             "observation": obs,
             "state": {"step_count": 0},
+            "context": {
+                "seed": AGENT_SEED,
+                "episode_id": episode_id,
+                "episode_today": episode_today,
+            },
         })
 
         messages = [
@@ -223,10 +359,11 @@ async def run_agent():
             {"role": "user", "content": obs["output"]},
         ]
 
-        for step in range(30):
+        for step in range(60):
             await broadcast({"type": "thinking", "step": step + 1})
 
-            response = client.chat.completions.create(
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
                 model=MODEL,
                 messages=messages,
                 tools=TOOLS,
@@ -269,6 +406,14 @@ async def run_agent():
                         "reward": reward,
                         "done": done,
                     })
+                    interrupt = _extract_interrupt(step + 1, obs["output"])
+                    if interrupt:
+                        await broadcast({
+                            "type": "interrupt",
+                            "step": step + 1,
+                            "interrupt_key": interrupt["key"],
+                            "message": interrupt["message"],
+                        })
 
                     messages.append({
                         "role": "tool",
@@ -306,6 +451,15 @@ async def main():
     print("Open it in your browser, then the agent will start in 2 seconds...")
 
     await run_agent()
+
+    print("\nAgent finished. Dashboard still running — refresh browser to review.")
+    print("Press Ctrl+C to exit.")
+    # Keep alive so dashboard stays up
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        pass
 
 
 # --- Dashboard HTML ---
@@ -400,6 +554,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .event.complete { background: #0f1a15; border-left: 3px solid #4ade80; color: #4ade80; font-weight: bold; }
   .event.calendar { background: #12121a; border-left: 3px solid #a78bfa; }
   .event.calendar strong { color: #a78bfa; }
+  .event.interrupt { background: #21180f; border-left: 3px solid #f59e0b; color: #f8d18d; }
   .event.error { background: #1a1012; border-left: 3px solid #f87171; }
   .step-badge {
     display: inline-block;
@@ -450,6 +605,104 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .stat-label { color: #666; }
   .stat-value { color: #e0e0e0; font-weight: 600; }
+  .episode-context {
+    padding: 12px 16px;
+    border-bottom: 1px solid #2a2a3a;
+    background: #10101a;
+  }
+  .context-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .context-row:last-child { margin-bottom: 0; }
+  .context-key { color: #7a7a93; text-transform: uppercase; letter-spacing: 0.5px; }
+  .context-value {
+    color: #d5d8ff;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    max-width: 190px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .interrupts {
+    padding: 12px 16px;
+    border-bottom: 1px solid #2a2a3a;
+    background: #0f1017;
+  }
+  .interrupt-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    padding: 7px 8px;
+    border-radius: 4px;
+    margin-bottom: 6px;
+    border: 1px solid #2a2a3a;
+  }
+  .interrupt-item:last-child { margin-bottom: 0; }
+  .interrupt-item.pending { color: #8a8aa3; background: #141624; }
+  .interrupt-item.fired { color: #ffd38a; background: #221a10; border-color: #5a4520; }
+  .interrupt-item.current { box-shadow: inset 0 0 0 1px #7c8aff80; }
+  .interrupt-step {
+    min-width: 44px;
+    color: #98a2ff;
+    font-size: 11px;
+    text-transform: uppercase;
+  }
+  .interrupt-label { flex: 1; line-height: 1.3; }
+  .interrupt-history {
+    margin: 0;
+    padding: 8px 16px 10px;
+    border-bottom: 1px solid #2a2a3a;
+    background: #0f1017;
+  }
+  .interrupt-history summary {
+    cursor: pointer;
+    color: #b4bbff;
+    font-size: 12px;
+    user-select: none;
+    list-style: none;
+  }
+  .interrupt-history summary::-webkit-details-marker { display: none; }
+  .interrupt-history summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 0.2s ease;
+  }
+  .interrupt-history[open] summary::before { transform: rotate(90deg); }
+  .interrupt-log {
+    margin-top: 8px;
+    max-height: 170px;
+    overflow-y: auto;
+    border: 1px solid #2a2a3a;
+    border-radius: 4px;
+    background: #141624;
+    padding: 8px;
+  }
+  .interrupt-log-item {
+    border-bottom: 1px solid #2a2a3a;
+    padding-bottom: 8px;
+    margin-bottom: 8px;
+  }
+  .interrupt-log-item:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+  }
+  .interrupt-log-header {
+    color: #d7dbff;
+    font-size: 11px;
+    margin-bottom: 4px;
+  }
+  .interrupt-log-empty {
+    color: #7a7a93;
+    font-size: 11px;
+    font-style: italic;
+  }
   .flags-section {
     padding: 16px;
     flex: 1;
@@ -516,13 +769,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat-row"><span class="stat-label">Pending Tasks</span><span class="stat-value" id="stat-pending">0</span></div>
       <div class="stat-row"><span class="stat-label">Reward</span><span class="stat-value" id="stat-reward">0.0</span></div>
     </div>
+    <div class="panel-header">Episode</div>
+    <div class="episode-context">
+      <div class="context-row"><span class="context-key">Seed</span><span class="context-value" id="ctx-seed">-</span></div>
+      <div class="context-row"><span class="context-key">Date</span><span class="context-value" id="ctx-date">-</span></div>
+      <div class="context-row"><span class="context-key">Episode ID</span><span class="context-value" id="ctx-episode-id">-</span></div>
+    </div>
+    <div class="panel-header">Interrupt Timeline</div>
+    <div class="interrupts" id="interrupts"></div>
+    <details class="interrupt-history" id="interrupt-history">
+      <summary id="interrupt-history-summary">Interrupt details (0)</summary>
+      <div class="interrupt-log" id="interrupt-log">
+        <div class="interrupt-log-empty">No interrupts fired yet.</div>
+      </div>
+    </details>
     <div class="panel-header">Tasks</div>
     <div class="flags-section" id="flags">
-      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>standup_scheduled</strong><div class="task-desc">Schedule standup tomorrow 9AM, 30min, Alice & Bob</div></div></div>
-      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>focus_time_booked</strong><div class="task-desc">Find free 1hr slot this afternoon, book focus time</div></div></div>
-      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>conflicts_resolved</strong><div class="task-desc">Check conflicts today and resolve them</div></div></div>
-      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>reminder_set</strong><div class="task-desc">Set reminder for dentist next Monday 2PM</div></div></div>
-      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>meeting_cancelled</strong><div class="task-desc">Cancel 'Old Project Review' and notify attendees</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>standup_scheduled</strong><div class="task-desc">Find time for Alice & Bob this week for standup</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>focus_time_booked</strong><div class="task-desc">Book 1hr+ focus time today with no overlaps</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>conflicts_resolved</strong><div class="task-desc">Clean up overlapping meetings today</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>reminder_set</strong><div class="task-desc">Dentist appointment next week, afternoon</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>meeting_cancelled</strong><div class="task-desc">Handle Old Project Review cancellation + notify</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>ceo_sync_accommodated</strong><div class="task-desc">[DYNAMIC] CEO Sync at 3PM, no conflicts</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>cancellation_handled</strong><div class="task-desc">[DYNAMIC] Handle Lunch with Client cancellation</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>reschedule_handled</strong><div class="task-desc">[DYNAMIC] Move Morning Sync to 11:00 AM</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>kickoff_scheduled</strong><div class="task-desc">Kickoff with Alice, Bob, Eve respecting constraints</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>hard_constraints_clear</strong><div class="task-desc">Zero hard-constraint violations</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>preferences_optimized</strong><div class="task-desc">Satisfy soft constraints/preferences</div></div></div>
     </div>
   </div>
 </div>
@@ -532,12 +805,26 @@ const feed = document.getElementById('feed');
 const statusEl = document.getElementById('status');
 
 const TASKS = [
-  { flag: 'standup_scheduled', desc: 'Schedule standup tomorrow 9AM, 30min, Alice & Bob' },
-  { flag: 'focus_time_booked', desc: 'Find free 1hr slot this afternoon, book focus time' },
-  { flag: 'conflicts_resolved', desc: 'Check conflicts today and resolve them' },
-  { flag: 'reminder_set', desc: 'Set reminder for dentist next Monday 2PM' },
-  { flag: 'meeting_cancelled', desc: "Cancel 'Old Project Review' and notify attendees" },
+  { flag: 'standup_scheduled', desc: 'Find time for Alice & Bob this week for standup' },
+  { flag: 'focus_time_booked', desc: 'Book 1hr+ focus time today with no overlaps' },
+  { flag: 'conflicts_resolved', desc: 'Clean up overlapping meetings today' },
+  { flag: 'reminder_set', desc: 'Dentist appointment next week, afternoon' },
+  { flag: 'meeting_cancelled', desc: 'Handle Old Project Review cancellation + notify' },
+  { flag: 'ceo_sync_accommodated', desc: '[DYNAMIC] CEO Sync at 3PM, no conflicts' },
+  { flag: 'cancellation_handled', desc: '[DYNAMIC] Handle Lunch with Client cancellation' },
+  { flag: 'reschedule_handled', desc: '[DYNAMIC] Move Morning Sync to 11:00 AM' },
+  { flag: 'kickoff_scheduled', desc: 'Kickoff with Alice, Bob, Eve respecting constraints' },
+  { flag: 'hard_constraints_clear', desc: 'Zero hard-constraint violations' },
+  { flag: 'preferences_optimized', desc: 'Satisfy soft constraints/preferences' },
 ];
+const INTERRUPTS = [
+  { key: 'ceo_sync', step: 3, label: 'Inject urgent CEO Sync at 15:00 today' },
+  { key: 'lunch_cancellation', step: 6, label: "Cancel 'Lunch with Client' and free 12:00-13:00 slot" },
+  { key: 'morning_reschedule', step: 9, label: "Request move: 'Morning Sync' to 11:00" },
+];
+let firedInterrupts = new Set();
+const interruptMessages = new Map();
+let interruptHistory = [];
 
 function addEvent(html, cls) {
   const div = document.createElement('div');
@@ -562,6 +849,54 @@ function updateFlags(flags) {
   }).join('');
 }
 
+function setEpisodeContext(context) {
+  document.getElementById('ctx-seed').textContent = context.seed ?? '-';
+  document.getElementById('ctx-date').textContent = context.episode_today ?? '-';
+  document.getElementById('ctx-episode-id').textContent = context.episode_id ?? '-';
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function renderInterrupts(currentStep = 0) {
+  const container = document.getElementById('interrupts');
+  container.innerHTML = INTERRUPTS.map(item => {
+    const fired = firedInterrupts.has(item.key);
+    const isCurrent = currentStep === item.step;
+    const cls = `${fired ? 'fired' : 'pending'} ${isCurrent ? 'current' : ''}`;
+    const hoverText = interruptMessages.get(item.key) || '';
+    const hoverAttr = hoverText ? ` title="${escapeHtml(hoverText)}"` : '';
+    return `<div class="interrupt-item ${cls}">` +
+      `<span class="interrupt-step">Step ${item.step}</span>` +
+      `<span class="interrupt-label"${hoverAttr}>${item.label}</span>` +
+      `</div>`;
+  }).join('');
+}
+
+function renderInterruptHistory() {
+  const summary = document.getElementById('interrupt-history-summary');
+  const log = document.getElementById('interrupt-log');
+  summary.textContent = `Interrupt details (${interruptHistory.length})`;
+
+  if (!interruptHistory.length) {
+    log.innerHTML = '<div class="interrupt-log-empty">No interrupts fired yet.</div>';
+    return;
+  }
+
+  log.innerHTML = interruptHistory.map(item => {
+    return `<div class="interrupt-log-item">` +
+      `<div class="interrupt-log-header">Step ${item.step} • ${escapeHtml(item.label)}</div>` +
+      `<pre>${escapeHtml(item.message)}</pre>` +
+      `</div>`;
+  }).join('');
+}
+
 function connect() {
   const ws = new WebSocket('ws://localhost:8001/ws/feed');
 
@@ -582,6 +917,9 @@ function connect() {
     switch (data.type) {
       case 'reset':
         feed.innerHTML = '';
+        firedInterrupts = new Set();
+        interruptMessages.clear();
+        interruptHistory = [];
         const taskListHtml = TASKS.map((t, i) => `  ${i+1}. ${t.desc}`).join('\\n');
         addEvent(
           `<strong>Environment Reset</strong><pre>${data.observation.output}</pre>` +
@@ -593,11 +931,15 @@ function connect() {
         document.getElementById('stat-step').textContent = '0';
         updateReward(0);
         updateFlags([]);
+        setEpisodeContext(data.context || {});
+        renderInterrupts(0);
+        renderInterruptHistory();
         break;
 
       case 'thinking':
         addEvent(`<span class="step-badge">Step ${data.step}</span> Thinking...`, 'thinking');
         document.getElementById('stat-step').textContent = data.step;
+        renderInterrupts(data.step);
         break;
 
       case 'tool_call':
@@ -618,6 +960,26 @@ function connect() {
         document.getElementById('stat-pending').textContent = data.pending_tasks;
         updateReward(data.reward);
         updateFlags(data.flags_found);
+        renderInterrupts(data.step);
+        break;
+
+      case 'interrupt':
+        firedInterrupts.add(data.interrupt_key);
+        interruptMessages.set(data.interrupt_key, data.message);
+        const meta = INTERRUPTS.find(x => x.key === data.interrupt_key);
+        interruptHistory.push({
+          step: data.step,
+          key: data.interrupt_key,
+          label: meta ? meta.label : data.interrupt_key,
+          message: data.message,
+        });
+        addEvent(
+          `<span class="step-badge">Step ${data.step}</span> <strong>Interrupt Fired</strong>` +
+          `<pre>${data.message}</pre>`,
+          'interrupt'
+        );
+        renderInterrupts(data.step);
+        renderInterruptHistory();
         break;
 
       case 'llm_text':
@@ -645,6 +1007,8 @@ function connect() {
   };
 }
 
+renderInterrupts(0);
+renderInterruptHistory();
 connect();
 </script>
 </body>

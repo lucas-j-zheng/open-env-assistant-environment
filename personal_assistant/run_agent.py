@@ -6,12 +6,10 @@ import os
 
 from dotenv import load_dotenv
 from openai import OpenAI
-import requests
 import websockets
 
 load_dotenv()
 
-SERVER_URL = "http://localhost:8000"
 WS_URL = "ws://localhost:8000/ws"
 MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
@@ -20,10 +18,12 @@ def print_separator():
     print("─" * 70)
 
 
-def print_full_state():
-    """Fetch and print the full environment state from REST."""
+async def print_full_state(ws):
+    """Fetch and print the full environment state via WebSocket."""
     try:
-        state = requests.get(f"{SERVER_URL}/state").json()
+        await ws.send(json.dumps({"type": "state"}))
+        resp = json.loads(await ws.recv())
+        state = resp.get("data", resp)
         print("  ┌── ENV STATE ──────────────────────────────────────")
         for k, v in state.items():
             print(f"  │ {k}: {v}")
@@ -149,13 +149,92 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_availability",
+            "description": "Check a person's availability on a given date. Shows their busy times from external commitments and free windows.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "person": {"type": "string", "description": "Person's name (e.g. Alice, Bob, Charlie, Dave, Eve)"},
+                    "date": {"type": "string", "description": "Date: 'today', 'tomorrow', day name, or YYYY-MM-DD", "default": "today"},
+                },
+                "required": ["person"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_event",
+            "description": "Edit an existing event. Only provided fields are changed. Use empty string or 0 to keep current value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Current title of the event to edit"},
+                    "new_title": {"type": "string", "description": "New title (optional)"},
+                    "new_date": {"type": "string", "description": "New date (optional)"},
+                    "new_start_time": {"type": "string", "description": "New start time HH:MM (optional)"},
+                    "new_duration_minutes": {"type": "integer", "description": "New duration in minutes (optional)"},
+                    "new_attendees": {"type": "string", "description": "New comma-separated attendees list (optional)"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_contact_preferences",
+            "description": "Get a person's scheduling preferences, private constraints, role, and preferred notification method. Some constraints are only visible through this tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "person": {"type": "string", "description": "Person's name (e.g. Alice, Bob, Charlie, Dave, Eve)"},
+                },
+                "required": ["person"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_constraints",
+            "description": "Get scheduling constraints (hard and soft) that apply to the calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_constraint_violations",
+            "description": "Check the current calendar for all constraint violations.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """You are a calendar personal assistant. You have access to tools to manage a calendar.
 
 Your goal is to complete ALL tasks on the task list. Start by calling get_task_list to see what needs to be done, then use the available tools to complete each task.
 
-Think step by step about what tools to call and in what order. After completing actions, check the task list again to verify progress."""
+IMPORTANT workflow:
+1. First call get_task_list and get_constraints to understand the rules.
+2. BEFORE scheduling any meeting with someone, call get_contact_preferences(person) to discover their private constraints and preferences.
+3. Use check_availability before scheduling — don't guess times.
+4. When scheduling, respect HARD constraints (must obey) and SOFT constraints (preferences).
+5. After making changes, call check_constraint_violations to catch any violations.
+6. Periodically call get_task_list to check which tasks are still TODO.
+7. Think step by step about what tools to call and in what order."""
 
 
 async def run_agent():
@@ -175,7 +254,7 @@ async def run_agent():
         print(f"  Output: {obs['output']}")
         print(f"  Events today: {obs['events_today']}")
         print(f"  Pending tasks: {obs['pending_tasks']}")
-        print_full_state()
+        await print_full_state(ws)
         print()
 
         messages = [
@@ -230,7 +309,7 @@ async def run_agent():
                     print(f"  │ Done: {done}")
                     print(f"  └──────────────────")
 
-                    print_full_state()
+                    await print_full_state(ws)
 
                     messages.append({
                         "role": "tool",
