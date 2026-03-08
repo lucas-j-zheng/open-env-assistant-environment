@@ -31,25 +31,25 @@ class Config:
     model_name: str = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
     lora_r: int = 32
     lora_alpha: int = 32
-    max_seq_len: int = 4096
+    max_seq_len: int = 2048
 
     # GRPO
-    group_size: int = 4           # episodes per seed
-    seeds_per_iter: int = 2       # seeds per iteration
-    max_steps_per_episode: int = 50  # more steps for 18 tasks + 7 interrupts
+    group_size: int = 2           # episodes per seed
+    seeds_per_iter: int = 1       # seeds per iteration
+    max_steps_per_episode: int = 25  # shorter episodes for speed
 
     # Training
-    num_iterations: int = 150
+    num_iterations: int = 30
     lr: float = 1e-5
     max_grad_norm: float = 1.0
     ppo_epochs: int = 1
 
     # Generation
     temperature: float = 0.7
-    max_new_tokens: int = 256
+    max_new_tokens: int = 128
 
     # Checkpointing
-    save_every: int = 25
+    save_every: int = 10
     output_dir: str = "/home/jovyan/checkpoints"
     log_file: str = "/home/jovyan/training_log.jsonl"
 
