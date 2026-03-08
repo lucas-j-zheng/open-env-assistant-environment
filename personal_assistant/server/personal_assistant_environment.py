@@ -12,6 +12,7 @@ availability, preferences, and constraints rather than follow explicit
 instructions.
 """
 
+import copy
 import json
 import random
 from collections import defaultdict
@@ -96,6 +97,9 @@ class PersonalAssistantEnvironment(Environment):
         {"name": "eve_not_before_10", "type": "hard", "visibility": "private", "person": "Eve", "description": "Eve is unavailable before 10:00 AM."},
         {"name": "alice_prefers_mornings", "type": "soft", "visibility": "private", "person": "Alice", "description": "Alice prefers meetings in the morning (before 12:00)."},
         {"name": "charlie_prefers_afternoons", "type": "soft", "visibility": "private", "person": "Charlie", "description": "Charlie prefers meetings in the afternoon (after 13:00)."},
+        {"name": "long_meetings_need_description", "type": "hard", "visibility": "public",
+         "description": "All meetings longer than 30 minutes must include a description/agenda.",
+         "requires_active": "description_policy"},
     ]
 
     # Per-person hidden info — only revealed by get_contact_preferences
@@ -142,6 +146,8 @@ class PersonalAssistantEnvironment(Environment):
         {"description": "Schedule a project kickoff meeting with Alice, Bob, and Eve — find a slot that respects everyone's constraints", "flag": "kickoff_scheduled"},
         {"description": "Ensure the calendar has zero hard-constraint violations (use check_constraint_violations to verify)", "flag": "hard_constraints_clear"},
         {"description": "Optimize the schedule so that as many soft constraints (preferences) as possible are satisfied", "flag": "preferences_optimized"},
+        {"description": "[DYNAMIC] Re-validate schedule after Bob's Wednesday availability changed", "flag": "availability_drift_handled"},
+        {"description": "[DYNAMIC] Ensure all meetings comply with the description/agenda policy", "flag": "description_policy_met"},
     ]
 
     INTERRUPTS = [
@@ -157,6 +163,20 @@ class PersonalAssistantEnvironment(Environment):
         {
             "at_step": 9, "type": "reschedule_request", "event_title": "Morning Sync", "new_time": "11:00",
             "message": "REQUEST: Alice asks to move 'Morning Sync' from 10:00 AM to 11:00 AM. Please reschedule it and confirm there are no new conflicts.",
+        },
+        {
+            "at_step": 7, "type": "availability_change",
+            "person": "Bob",
+            "new_blocks": {"wednesday": [("13:00", "17:00")]},
+            "message": "UPDATE from Bob: \"I'm now unavailable Wednesday afternoons (1 PM onwards) "
+                       "due to a recurring client engagement. Please update anything that conflicts.\"",
+        },
+        {
+            "at_step": 12, "type": "policy_change",
+            "policy": "description_required",
+            "message": "HR POLICY UPDATE: Effective immediately, all meetings longer than 30 minutes "
+                       "must include a description/agenda. Meetings created without one will be flagged "
+                       "as non-compliant. Use edit_event with new_description to fix existing meetings.",
         },
     ]
 
@@ -222,8 +242,15 @@ class PersonalAssistantEnvironment(Environment):
         self._had_initial_conflicts = False
         self._fired_interrupts: set[int] = set()
         self._pending_interrupt_msg: str = ""
+        self._pending_interrupt_msgs: list[str] = []
+        self._unhandled_interrupts: dict[int, str] = {}
         self._active_negotiations: dict[str, dict] = {}
         self._negotiation_resolved: dict[str, bool] = {}
+        self._discovered_preferences: dict[str, dict] = {}  # person -> prefs returned
+        self._discovered_constraints: list[dict] = []  # private constraints revealed
+        self._negotiation_feedback: dict[str, str] = {}  # scenario_id -> last rejection msg
+        self._attendee_schedules = copy.deepcopy(self.ATTENDEE_SCHEDULES)
+        self._description_policy_active = False
         self._seed: int = 0
         self._rng = random.Random(self._seed)
         self._episode_today: date = self.DEFAULT_EPISODE_BASE_DATE
@@ -291,13 +318,20 @@ class PersonalAssistantEnvironment(Environment):
 
     # --- Constraint evaluation ---
 
+    def _is_constraint_active(self, constraint: dict) -> bool:
+        required = constraint.get("requires_active")
+        if required == "description_policy":
+            return self._description_policy_active
+        return True
+
     def _evaluate_constraints(self) -> dict:
         hard_violations, soft_violations = [], []
-        for constraint in self.CONSTRAINTS:
+        active_constraints = [c for c in self.CONSTRAINTS if self._is_constraint_active(c)]
+        for constraint in active_constraints:
             violations = self._check_single_constraint(constraint)
             (hard_violations if constraint["type"] == "hard" else soft_violations).extend(violations)
-        hard_total = sum(1 for c in self.CONSTRAINTS if c["type"] == "hard")
-        soft_total = sum(1 for c in self.CONSTRAINTS if c["type"] == "soft")
+        hard_total = sum(1 for c in active_constraints if c["type"] == "hard")
+        soft_total = sum(1 for c in active_constraints if c["type"] == "soft")
         return {
             "hard_violations": hard_violations, "soft_violations": soft_violations,
             "hard_satisfied": hard_total - len({v["constraint"] for v in hard_violations}),
@@ -342,6 +376,11 @@ class PersonalAssistantEnvironment(Environment):
             for (person, date), count in counts.items():
                 if count > 3:
                     violations.append({"constraint": name, "event": f"(multiple on {date})", "detail": f"{person} has {count} meetings on {date} (max preferred: 3)"})
+        elif name == "long_meetings_need_description":
+            if self._description_policy_active:
+                for e in self._events:
+                    if e.get("duration_minutes", 0) > 30 and not e.get("description", ""):
+                        violations.append({"constraint": name, "event": e["title"], "detail": f"'{e['title']}' is {e['duration_minutes']}min with no description/agenda"})
         return violations
 
     # --- Negotiation helpers ---
@@ -368,7 +407,7 @@ class PersonalAssistantEnvironment(Environment):
         # Collect all busy blocks for this person on this date
         day_name = self._get_day_name(event_date)
         busy = []
-        for bs, be in self.ATTENDEE_SCHEDULES.get(person, {}).get(day_name, []):
+        for bs, be in self._attendee_schedules.get(person, {}).get(day_name, []):
             busy.append((
                 datetime.strptime(f"{event_date} {bs}", "%Y-%m-%d %H:%M"),
                 datetime.strptime(f"{event_date} {be}", "%Y-%m-%d %H:%M"),
@@ -505,18 +544,20 @@ class PersonalAssistantEnvironment(Environment):
             lines.append(f"  - {e['title']} | {e['start_time']}-{e['end_time']} | Attendees: {', '.join(e.get('attendees', []))}")
         return "\n".join(lines)
 
-    def tool_create_event(self, title: str, date: str, start_time: str, duration_minutes: int = 60, attendees: str = "") -> str:
+    def tool_create_event(self, title: str, date: str, start_time: str, duration_minutes: int = 60, attendees: str = "", description: str = "") -> str:
         target = self._resolve_date(date)
         end_time = (datetime.strptime(f"{target} {start_time}", "%Y-%m-%d %H:%M") + timedelta(minutes=duration_minutes)).strftime("%H:%M")
-        event = {"id": self._next_event_id(), "title": title, "date": target, "start_time": start_time, "end_time": end_time, "duration_minutes": duration_minutes, "attendees": [a.strip() for a in attendees.split(",") if a.strip()]}
+        event = {"id": self._next_event_id(), "title": title, "date": target, "start_time": start_time, "end_time": end_time, "duration_minutes": duration_minutes, "attendees": [a.strip() for a in attendees.split(",") if a.strip()], "description": description}
 
         # --- Negotiation check ---
         scenario_id = self._match_negotiation_scenario(event)
         if scenario_id is not None:
             rejection = self._run_negotiation(scenario_id, event)
             if rejection is not None:
+                self._negotiation_feedback[scenario_id] = rejection
                 return f"Event '{title}' was NOT created.\n\n{rejection}"
             # If rejection is None, negotiation passed — fall through to create
+            self._negotiation_feedback.pop(scenario_id, None)
 
         self._events.append(event)
         warnings = []
@@ -598,7 +639,7 @@ class PersonalAssistantEnvironment(Environment):
         person_key = person.strip().title()
         lines = [f"Availability for {person_key} on {target} ({day_name}):"]
 
-        schedule = self.ATTENDEE_SCHEDULES.get(person_key, {})
+        schedule = self._attendee_schedules.get(person_key, {})
         busy_blocks = schedule.get(day_name, [])
         if busy_blocks:
             lines.append("  External commitments (busy):")
@@ -637,7 +678,7 @@ class PersonalAssistantEnvironment(Environment):
             lines.append("  No free windows on this date.")
         return "\n".join(lines)
 
-    def tool_edit_event(self, title: str, new_title: str = "", new_date: str = "", new_start_time: str = "", new_duration_minutes: int = 0, new_attendees: str = "") -> str:
+    def tool_edit_event(self, title: str, new_title: str = "", new_date: str = "", new_start_time: str = "", new_duration_minutes: int = 0, new_attendees: str = "", new_description: str = "") -> str:
         """Edit an existing event. Only provided fields are changed. Use empty string or 0 to keep current value."""
         matches = [e for e in self._events if e["title"].lower() == title.lower()]
         if not matches:
@@ -668,6 +709,9 @@ class PersonalAssistantEnvironment(Environment):
             old_att = ", ".join(event.get("attendees", []))
             event["attendees"] = [a.strip() for a in new_attendees.split(",") if a.strip()]
             changes.append(f"attendees: [{old_att}] → [{new_attendees}]")
+        if new_description:
+            changes.append(f"description: added")
+            event["description"] = new_description
         if not changes:
             return f"No changes specified for '{title}'."
         # Check constraint warnings
@@ -685,6 +729,8 @@ class PersonalAssistantEnvironment(Environment):
         lines = ["Scheduling Constraints:", "", "HARD constraints (must be satisfied):"]
         for c in self.CONSTRAINTS:
             if c["type"] == "hard" and c.get("visibility") == "public":
+                if not self._is_constraint_active(c):
+                    continue
                 lines.append(f"  - {c['description']}")
         lines += ["", "SOFT constraints (preferences, partial credit):"]
         for c in self.CONSTRAINTS:
@@ -708,6 +754,13 @@ class PersonalAssistantEnvironment(Environment):
             for c in person_constraints:
                 label = "HARD" if c["type"] == "hard" else "SOFT"
                 lines.append(f"    - [{label}] {c['description']}")
+
+        # Track discovery for state summary
+        self._discovered_preferences[person_key] = prefs
+        for c in person_constraints:
+            if c not in self._discovered_constraints:
+                self._discovered_constraints.append(c)
+
         return "\n".join(lines)
 
     def tool_check_constraint_violations(self) -> str:
@@ -719,6 +772,111 @@ class PersonalAssistantEnvironment(Environment):
             lines += ["", "SOFT CONSTRAINT VIOLATIONS (preferences not met):"] + [f"  - [{v['constraint']}] {v['detail']}" for v in result["soft_violations"]]
         if not result["hard_violations"] and not result["soft_violations"]:
             lines += ["", "All constraints satisfied!"]
+        return "\n".join(lines)
+
+    # --- State summary for Markov observations ---
+
+    def _render_state_summary(self) -> str:
+        """Render a compact text snapshot of the full environment state.
+
+        Contains everything the agent needs to act optimally from this point
+        forward, without relying on conversation history.
+        """
+        today = self._resolve_date("today")
+        lines = [
+            f"=== CALENDAR STATE (step {self._state.step_count}) ===",
+            f"Today: {today} ({self._get_day_name(today)})",
+        ]
+
+        # --- Task status ---
+        done_flags = sorted(self._found)
+        todo_flags = [t["flag"] for t in self._tasks if t["flag"] not in self._found]
+        lines.append(f"Completed: {done_flags} ({len(done_flags)}/{len(self._tasks)})")
+        lines.append(f"Pending: {todo_flags}")
+        lines.append("")
+
+        # --- Calendar snapshot (grouped by date) ---
+        lines.append("Events:")
+        if not self._events:
+            lines.append("  (none)")
+        else:
+            events_by_date: dict[str, list[dict]] = {}
+            for e in self._events:
+                events_by_date.setdefault(e["date"], []).append(e)
+            for d in sorted(events_by_date.keys()):
+                day_label = "today" if d == today else d
+                for e in sorted(events_by_date[d], key=lambda x: x["start_time"]):
+                    att = ", ".join(e.get("attendees", [])) or "(none)"
+                    desc_marker = " [has agenda]" if e.get("description") else ""
+                    lines.append(f"  [{day_label}] {e['title']} | {e['start_time']}-{e['end_time']} | {att}{desc_marker}")
+        lines.append("")
+
+        # --- Known preferences (only what agent has queried) ---
+        all_people = list(self.CONTACT_PREFERENCES.keys())
+        queried = sorted(self._discovered_preferences.keys())
+        unqueried = [p for p in all_people if p not in self._discovered_preferences]
+        if queried:
+            lines.append("Known Preferences:")
+            for person in queried:
+                prefs = self._discovered_preferences[person]
+                person_constraints = [c for c in self._discovered_constraints if c.get("person") == person]
+                hard_strs = [c["description"] for c in person_constraints if c["type"] == "hard"]
+                soft_strs = [c["description"] for c in person_constraints if c["type"] == "soft"]
+                constraint_parts = []
+                if hard_strs:
+                    constraint_parts.append(f"HARD: {'; '.join(hard_strs)}")
+                if soft_strs:
+                    constraint_parts.append(f"SOFT: {'; '.join(soft_strs)}")
+                constraint_str = " | ".join(constraint_parts) if constraint_parts else "no private constraints"
+                lines.append(f"  {person}: {prefs.get('role', '?')}, notify via {prefs.get('notification_preference', '?')} | {constraint_str}")
+        if unqueried:
+            lines.append(f"Unqueried People: {', '.join(unqueried)}")
+        lines.append("")
+
+        # --- Constraint violations ---
+        result = self._evaluate_constraints()
+        if result["hard_violations"] or result["soft_violations"]:
+            lines.append("Constraint Violations:")
+            for v in result["hard_violations"]:
+                lines.append(f"  HARD: [{v['constraint']}] {v['detail']}")
+            for v in result["soft_violations"]:
+                lines.append(f"  SOFT: [{v['constraint']}] {v['detail']}")
+        else:
+            lines.append("Constraints: all satisfied")
+        lines.append("")
+
+        # --- Negotiations ---
+        if self._active_negotiations or self._negotiation_resolved:
+            lines.append("Negotiations:")
+            for sid, neg in self._active_negotiations.items():
+                feedback = self._negotiation_feedback.get(sid, "")
+                # Truncate feedback to keep compact
+                if len(feedback) > 120:
+                    feedback = feedback[:120] + "..."
+                lines.append(f"  {sid}: round {neg['current_round']}, attempt {neg['attempts']}, feedback: {feedback}")
+            for sid, success in self._negotiation_resolved.items():
+                lines.append(f"  {sid}: {'RESOLVED' if success else 'FAILED'}")
+            lines.append("")
+
+        # --- Unhandled interrupts ---
+        if self._pending_interrupt_msgs:
+            lines.append("Unhandled Interrupts:")
+            for msg in self._pending_interrupt_msgs:
+                lines.append(f"  - {msg}")
+            lines.append("")
+
+        # --- Notifications sent ---
+        if self._notifications:
+            lines.append("Notifications Sent:")
+            for n in self._notifications:
+                lines.append(f"  → {n['to']}: {n['message'][:80]}")
+            lines.append("")
+
+        # --- Active policies ---
+        if self._description_policy_active:
+            lines.append("Active Policies: description_required (meetings >30min need agenda)")
+            lines.append("")
+
         return "\n".join(lines)
 
     TOOL_MAP = {
@@ -741,10 +899,36 @@ class PersonalAssistantEnvironment(Environment):
         method_name = self.TOOL_MAP.get(tool_name)
         if not method_name:
             return f"Unknown tool '{tool_name}'. Available tools: {', '.join(self.TOOL_MAP.keys())}"
+        if not arguments:
+            arguments = {}
         try:
             return getattr(self, method_name)(**arguments)
         except TypeError as e:
             return f"Error calling {tool_name}: {e}"
+
+    def _is_interrupt_handled(self, intr: dict) -> bool:
+        intr_type = intr.get("type")
+        if intr_type == "new_meeting":
+            return "ceo_sync_accommodated" in self._found
+        if intr_type == "cancellation":
+            return "cancellation_handled" in self._found
+        if intr_type == "reschedule_request":
+            return "reschedule_handled" in self._found
+        if intr_type == "availability_change":
+            return "availability_drift_handled" in self._found
+        if intr_type == "policy_change":
+            return "description_policy_met" in self._found
+        return False
+
+    def _refresh_unhandled_interrupts(self):
+        handled_indexes = []
+        for idx, _msg in self._unhandled_interrupts.items():
+            intr = self._interrupts[idx]
+            if self._is_interrupt_handled(intr):
+                handled_indexes.append(idx)
+        for idx in handled_indexes:
+            self._unhandled_interrupts.pop(idx, None)
+        self._pending_interrupt_msgs = list(self._unhandled_interrupts.values())
 
     def _process_interrupts(self):
         step = self._state.step_count
@@ -757,13 +941,29 @@ class PersonalAssistantEnvironment(Environment):
                     event_data["id"] = self._next_event_id()
                     self._events.append(event_data)
                     self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}"
+                    self._unhandled_interrupts[i] = intr["message"]
                 elif intr["type"] == "cancellation":
                     for e in self._events:
                         if e["title"].lower() == intr["cancel_title"].lower():
                             e["cancelled"] = True
-                    self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}\nPlease delete '{intr['cancel_title']}' from the calendar."
+                    full_msg = f"{intr['message']}\nPlease delete '{intr['cancel_title']}' from the calendar."
+                    self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{full_msg}"
+                    self._unhandled_interrupts[i] = full_msg
                 elif intr["type"] == "reschedule_request":
                     self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}"
+                    self._unhandled_interrupts[i] = intr["message"]
+                elif intr["type"] == "availability_change":
+                    person = intr["person"]
+                    for day, blocks in intr["new_blocks"].items():
+                        self._attendee_schedules[person][day].extend(blocks)
+                        self._attendee_schedules[person][day].sort()
+                    self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}"
+                    self._unhandled_interrupts[i] = intr["message"]
+                elif intr["type"] == "policy_change":
+                    if intr["policy"] == "description_required":
+                        self._description_policy_active = True
+                    self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}"
+                    self._unhandled_interrupts[i] = intr["message"]
 
     # --- Completion checking (outcome-based) ---
 
@@ -790,7 +990,7 @@ class PersonalAssistantEnvironment(Environment):
             day_name = self._get_day_name(e["date"])
             bad = False
             for person in ["Alice", "Bob"]:
-                for bs, be in self.ATTENDEE_SCHEDULES.get(person, {}).get(day_name, []):
+                for bs, be in self._attendee_schedules.get(person, {}).get(day_name, []):
                     if e["start_time"] < be and e["end_time"] > bs:
                         bad = True
                         break
@@ -914,7 +1114,7 @@ class PersonalAssistantEnvironment(Environment):
             day_name = self._get_day_name(ke["date"])
             schedule_ok = True
             for person in ke.get("attendees", []):
-                for bs, be in self.ATTENDEE_SCHEDULES.get(person, {}).get(day_name, []):
+                for bs, be in self._attendee_schedules.get(person, {}).get(day_name, []):
                     if ke["start_time"] < be and ke["end_time"] > bs:
                         schedule_ok = False
                         break
@@ -951,6 +1151,39 @@ class PersonalAssistantEnvironment(Environment):
             self._found.add("preferences_optimized")
         else:
             self._found.discard("preferences_optimized")
+
+        # availability_drift_handled (revocable) — only after availability_change interrupt fires
+        avail_interrupt_idx = next((i for i, intr in enumerate(self._interrupts) if intr.get("type") == "availability_change"), None)
+        if avail_interrupt_idx is not None and avail_interrupt_idx in self._fired_interrupts:
+            drift_ok = True
+            for e in self._events:
+                if "Bob" not in e.get("attendees", []):
+                    continue
+                day_name = self._get_day_name(e["date"])
+                if day_name != "wednesday":
+                    continue
+                for bs, be in self._attendee_schedules.get("Bob", {}).get("wednesday", []):
+                    if e["start_time"] < be and e["end_time"] > bs:
+                        drift_ok = False
+                        break
+                if not drift_ok:
+                    break
+            if drift_ok:
+                self._found.add("availability_drift_handled")
+            else:
+                self._found.discard("availability_drift_handled")
+
+        # description_policy_met (revocable) — only after policy_change interrupt fires
+        if self._description_policy_active:
+            desc_ok = True
+            for e in self._events:
+                if e.get("duration_minutes", 0) > 30 and not e.get("description", ""):
+                    desc_ok = False
+                    break
+            if desc_ok:
+                self._found.add("description_policy_met")
+            else:
+                self._found.discard("description_policy_met")
 
     def _seed_initial_events(self):
         today = self._resolve_date("today")
@@ -992,32 +1225,32 @@ class PersonalAssistantEnvironment(Environment):
         self._notifications = []
         self._fired_interrupts = set()
         self._pending_interrupt_msg = ""
+        self._pending_interrupt_msgs = []
+        self._unhandled_interrupts = {}
         self._active_negotiations = {}
         self._negotiation_resolved = {}
+        self._discovered_preferences = {}
+        self._discovered_constraints = []
+        self._negotiation_feedback = {}
+        self._attendee_schedules = copy.deepcopy(self.ATTENDEE_SCHEDULES)
+        self._description_policy_active = False
         self._set_episode_context(seed=seed, episode_id=episode_id)
         self._seed_initial_events()
         self._had_initial_conflicts = True
         self._check_completions()
-
-        new_flags = len(self._found)
-        reward = new_flags / len(self._tasks)
-        done = new_flags == len(self._tasks)
-        self._state.tasks_completed = new_flags
+        self._refresh_unhandled_interrupts()
 
         event_count = len([e for e in self._events if e["date"] == self._resolve_date("today")])
-        return CalendarObservation(
-            output=f"Calendar assistant ready. You have {event_count} events today including a scheduling conflict. "
-                   "There are also person-specific constraints and preferences to satisfy. "
-                   "Use get_task_list to see what needs to be done, get_constraints for general rules, "
-                   "get_contact_preferences to learn about individual people's needs, "
-                   "and check_availability to look up people's schedules before booking. "
-                   "Warning: new requests may arrive while you work — stay alert and adapt. "
-                   "Note: Attendees may push back on meeting invites — be prepared to adapt your proposals.",
-            pending_tasks=len(self._tasks) - new_flags,
-            events_today=len([e for e in self._events if e["date"] == self._resolve_date("today")]),
-            metadata={"seed": self._seed, "episode_today": self._resolve_date("today")},
-            flags_found=list(self._found), done=done, reward=reward,
+        output = (
+            f"Calendar assistant ready. You have {event_count} events today including a scheduling conflict. "
+            "There are also person-specific constraints and preferences to satisfy. "
+            "Use get_task_list to see what needs to be done, get_constraints for general rules, "
+            "get_contact_preferences to learn about individual people's needs, "
+            "and check_availability to look up people's schedules before booking. "
+            "Warning: new requests may arrive while you work — stay alert and adapt. "
+            "Note: Attendees may push back on meeting invites — be prepared to adapt your proposals."
         )
+        return self._build_observation(output)
 
     def step(self, action: CalendarAction, **kwargs) -> CalendarObservation:
         self._state.step_count += 1
@@ -1046,20 +1279,53 @@ class PersonalAssistantEnvironment(Environment):
             )
 
         self._check_completions()
+        self._refresh_unhandled_interrupts()
 
         if self._pending_interrupt_msg:
             output += self._pending_interrupt_msg
 
+        return self._build_observation(output)
+
+    def _build_observation(self, output: str) -> CalendarObservation:
+        """Build a Markov observation with full state snapshot."""
         new_flags = len(self._found)
         reward = new_flags / len(self._tasks)
         done = new_flags == len(self._tasks)
         self._state.tasks_completed = new_flags
 
+        # Build negotiation snapshot for structured access
+        neg_snapshot = {}
+        for sid, neg in self._active_negotiations.items():
+            neg_snapshot[sid] = {
+                "round": neg["current_round"],
+                "attempts": neg["attempts"],
+                "last_feedback": self._negotiation_feedback.get(sid, ""),
+            }
+
+        constraint_result = self._evaluate_constraints()
+
         return CalendarObservation(
-            output=output, pending_tasks=len(self._tasks) - new_flags,
+            output=output,
+            pending_tasks=len(self._tasks) - new_flags,
             events_today=len([e for e in self._events if e["date"] == self._resolve_date("today")]),
             metadata={"seed": self._seed, "episode_today": self._resolve_date("today")},
-            flags_found=list(self._found), reward=reward, done=done,
+            flags_found=list(self._found),
+            reward=reward,
+            done=done,
+            # Markov state
+            state_summary=self._render_state_summary(),
+            calendar_snapshot=[
+                {k: v for k, v in e.items() if k != "cancelled"}
+                for e in self._events if not e.get("cancelled")
+            ],
+            discovered_preferences=dict(self._discovered_preferences),
+            discovered_constraints=list(self._discovered_constraints),
+            constraint_status=constraint_result,
+            active_negotiations=neg_snapshot,
+            resolved_negotiations=dict(self._negotiation_resolved),
+            unhandled_interrupts=list(self._pending_interrupt_msgs),
+            notifications_sent=list(self._notifications),
+            step_count=self._state.step_count,
         )
 
     @property

@@ -19,7 +19,7 @@ import websockets
 load_dotenv()
 
 WS_URL = "ws://localhost:8000/ws"
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "Qwen/Qwen2.5-72B-Instruct"
 AGENT_SEED = int(os.getenv("AGENT_SEED", "7"))
 EPISODE_BASE_DATE = date(2026, 1, 5)  # Keep in sync with environment.
 EPISODE_WEEKS = 3  # Keep in sync with environment.
@@ -88,6 +88,7 @@ TOOLS = [
                     "start_time": {"type": "string", "description": "HH:MM format"},
                     "duration_minutes": {"type": "integer", "default": 60},
                     "attendees": {"type": "string", "description": "Comma-separated names"},
+                    "description": {"type": "string", "description": "Meeting agenda/description (required for meetings >30 min after policy update)"},
                 },
                 "required": ["title", "date", "start_time"],
             },
@@ -121,6 +122,7 @@ TOOLS = [
                     "new_start_time": {"type": "string", "description": "New start time HH:MM (optional)"},
                     "new_duration_minutes": {"type": "integer", "description": "New duration in minutes (optional)"},
                     "new_attendees": {"type": "string", "description": "New comma-separated attendees list — replaces all current attendees (optional)"},
+                    "new_description": {"type": "string", "description": "New description/agenda for the event"},
                 },
                 "required": ["title"],
             },
@@ -265,7 +267,9 @@ IMPORTANT workflow:
 6. Periodically call get_task_list to check which tasks are still TODO.
 7. The "preferences_optimized" task requires soft constraints to be satisfied. If you see soft violations, fix them.
 8. Think step by step about what tools to call and in what order.
-9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters."""
+9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters.
+10. Pay attention to policy changes announced via interrupts. Rules may change mid-session — tools and constraints that worked before may behave differently after an update. Re-check constraints after any policy announcement.
+11. If someone's availability changes, re-validate any meetings you already scheduled with that person."""
 
 
 # --- Agent Logic ---
@@ -287,10 +291,14 @@ def _extract_interrupt(step: int, output: str) -> dict | None:
     interrupt_text = output.split("--- INTERRUPT ---", 1)[1].strip()
     if step == 3 or "CEO" in interrupt_text:
         key = "ceo_sync"
+    elif step == 7 or "unavailable Wednesday" in interrupt_text:
+        key = "availability_change"
     elif step == 6 or "Lunch with Client" in interrupt_text:
         key = "lunch_cancellation"
     elif step == 9 or "Morning Sync" in interrupt_text:
         key = "morning_reschedule"
+    elif step == 12 or "description/agenda" in interrupt_text:
+        key = "description_policy"
     else:
         key = f"interrupt_step_{step}"
 
@@ -330,8 +338,8 @@ async def run_agent():
     await asyncio.sleep(2)
 
     client = OpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://router.huggingface.co/v1",
+        api_key=os.getenv("HF_TOKEN"),
     )
 
     async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=120) as ws:
@@ -355,13 +363,19 @@ async def run_agent():
             },
         })
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": obs["output"]},
-        ]
+        # Sliding window: keep system prompt + state summary + last N exchanges
+        SLIDING_WINDOW = 6  # keep last 6 messages (3 tool call/result pairs)
+        history = []  # full history for sliding window
+        latest_state_summary = obs.get("state_summary", obs["output"])
 
         for step in range(60):
             await broadcast({"type": "thinking", "step": step + 1})
+
+            # Build messages: system + state summary + recent history
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": latest_state_summary},
+            ] + history[-SLIDING_WINDOW:]
 
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -374,11 +388,11 @@ async def run_agent():
             msg = response.choices[0].message
 
             if msg.tool_calls:
-                messages.append(msg)
+                history.append(msg)
 
                 for tool_call in msg.tool_calls:
                     tool_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
+                    args = json.loads(tool_call.function.arguments or "{}")
 
                     await broadcast({
                         "type": "tool_call",
@@ -395,6 +409,9 @@ async def run_agent():
                     obs = data["observation"]
                     reward = data.get("reward", 0)
                     done = data.get("done", False)
+
+                    # Update state summary from latest observation
+                    latest_state_summary = obs.get("state_summary", latest_state_summary)
 
                     await broadcast({
                         "type": "observation",
@@ -416,7 +433,7 @@ async def run_agent():
                             "message": interrupt["message"],
                         })
 
-                    messages.append({
+                    history.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": obs["output"],
@@ -432,8 +449,8 @@ async def run_agent():
                     "step": step + 1,
                     "content": msg.content,
                 })
-                messages.append(msg)
-                messages.append({"role": "user", "content": "Continue completing the remaining tasks. Use the tools available to you."})
+                history.append(msg)
+                history.append({"role": "user", "content": "Continue completing the remaining tasks. Use the tools available to you."})
 
         calendar = await _fetch_final_calendar(ws)
         await broadcast({"type": "max_steps_reached", "calendar": calendar})
@@ -797,6 +814,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="task-item todo"><span class="flag-icon">○</span><div><strong>kickoff_scheduled</strong><div class="task-desc">Kickoff with Alice, Bob, Eve respecting constraints</div></div></div>
       <div class="task-item todo"><span class="flag-icon">○</span><div><strong>hard_constraints_clear</strong><div class="task-desc">Zero hard-constraint violations</div></div></div>
       <div class="task-item todo"><span class="flag-icon">○</span><div><strong>preferences_optimized</strong><div class="task-desc">Satisfy soft constraints/preferences</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>availability_drift_handled</strong><div class="task-desc">[DYNAMIC] Re-validate after Bob availability change</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>description_policy_met</strong><div class="task-desc">[DYNAMIC] All meetings comply with description policy</div></div></div>
     </div>
   </div>
 </div>
@@ -817,11 +836,15 @@ const TASKS = [
   { flag: 'kickoff_scheduled', desc: 'Kickoff with Alice, Bob, Eve respecting constraints' },
   { flag: 'hard_constraints_clear', desc: 'Zero hard-constraint violations' },
   { flag: 'preferences_optimized', desc: 'Satisfy soft constraints/preferences' },
+  { flag: 'availability_drift_handled', desc: '[DYNAMIC] Re-validate after Bob availability change' },
+  { flag: 'description_policy_met', desc: '[DYNAMIC] All meetings comply with description policy' },
 ];
 const INTERRUPTS = [
   { key: 'ceo_sync', step: 3, label: 'Inject urgent CEO Sync at 15:00 today' },
+  { key: 'availability_change', step: 7, label: "Bob's Wednesday afternoons now blocked" },
   { key: 'lunch_cancellation', step: 6, label: "Cancel 'Lunch with Client' and free 12:00-13:00 slot" },
   { key: 'morning_reschedule', step: 9, label: "Request move: 'Morning Sync' to 11:00" },
+  { key: 'description_policy', step: 12, label: "HR: meetings >30min need description" },
 ];
 let firedInterrupts = new Set();
 const interruptMessages = new Map();

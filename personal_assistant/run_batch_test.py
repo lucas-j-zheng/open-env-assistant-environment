@@ -31,13 +31,15 @@ IMPORTANT workflow:
 6. Periodically call get_task_list to check which tasks are still TODO.
 7. The "preferences_optimized" task requires soft constraints to be satisfied. If you see soft violations, fix them.
 8. Think step by step about what tools to call and in what order.
-9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters."""
+9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters.
+10. Pay attention to policy changes announced via interrupts. Rules may change mid-session — tools and constraints that worked before may behave differently after an update. Re-check constraints after any policy announcement.
+11. If someone's availability changes, re-validate any meetings you already scheduled with that person."""
 
 TOOLS = [
     {"type": "function", "function": {"name": "list_events", "description": "List all calendar events for a given date.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "description": "Date string: 'today', 'tomorrow', 'next monday', or YYYY-MM-DD"}}, "required": []}}},
-    {"type": "function", "function": {"name": "create_event", "description": "Create a calendar event.", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "date": {"type": "string", "description": "'today', 'tomorrow', 'next monday', or YYYY-MM-DD"}, "start_time": {"type": "string", "description": "HH:MM format"}, "duration_minutes": {"type": "integer", "default": 60}, "attendees": {"type": "string", "description": "Comma-separated names"}}, "required": ["title", "date", "start_time"]}}},
+    {"type": "function", "function": {"name": "create_event", "description": "Create a calendar event.", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "date": {"type": "string", "description": "'today', 'tomorrow', 'next monday', or YYYY-MM-DD"}, "start_time": {"type": "string", "description": "HH:MM format"}, "duration_minutes": {"type": "integer", "default": 60}, "attendees": {"type": "string", "description": "Comma-separated names"}, "description": {"type": "string", "description": "Meeting agenda/description (required for meetings >30 min after policy update)"}}, "required": ["title", "date", "start_time"]}}},
     {"type": "function", "function": {"name": "delete_event", "description": "Delete a calendar event by title.", "parameters": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}}},
-    {"type": "function", "function": {"name": "edit_event", "description": "Edit an existing event. Only provided fields are changed.", "parameters": {"type": "object", "properties": {"title": {"type": "string", "description": "Current title of the event to edit"}, "new_title": {"type": "string"}, "new_date": {"type": "string"}, "new_start_time": {"type": "string", "description": "HH:MM"}, "new_duration_minutes": {"type": "integer"}, "new_attendees": {"type": "string", "description": "Comma-separated, replaces all"}}, "required": ["title"]}}},
+    {"type": "function", "function": {"name": "edit_event", "description": "Edit an existing event. Only provided fields are changed.", "parameters": {"type": "object", "properties": {"title": {"type": "string", "description": "Current title of the event to edit"}, "new_title": {"type": "string"}, "new_date": {"type": "string"}, "new_start_time": {"type": "string", "description": "HH:MM"}, "new_duration_minutes": {"type": "integer"}, "new_attendees": {"type": "string", "description": "Comma-separated, replaces all"}, "new_description": {"type": "string", "description": "New description/agenda for the event"}}, "required": ["title"]}}},
     {"type": "function", "function": {"name": "find_free_slots", "description": "Find available time slots on a given date (8:00-18:00).", "parameters": {"type": "object", "properties": {"date": {"type": "string", "default": "today"}, "duration_minutes": {"type": "integer", "default": 60}}, "required": []}}},
     {"type": "function", "function": {"name": "check_conflicts", "description": "Check for scheduling conflicts on a date.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "default": "today"}}, "required": []}}},
     {"type": "function", "function": {"name": "resolve_conflict", "description": "Resolve a conflict by moving an event to a new time.", "parameters": {"type": "object", "properties": {"event_title": {"type": "string"}, "new_start_time": {"type": "string", "description": "HH:MM format"}}, "required": ["event_title", "new_start_time"]}}},
@@ -71,10 +73,10 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
         reset_resp = json.loads(await ws.recv())
         obs = reset_resp["data"]["observation"]
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": obs["output"]},
-        ]
+        # Sliding window: state summary + last N exchanges
+        SLIDING_WINDOW = 6
+        history = []
+        latest_state_summary = obs.get("state_summary", obs["output"])
 
         final_reward = 0
         final_flags = []
@@ -82,6 +84,13 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
 
         for step in range(MAX_STEPS):
             steps_used = step + 1
+
+            # Build messages: system + state summary + recent history
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": latest_state_summary},
+            ] + history[-SLIDING_WINDOW:]
+
             try:
                 response = await asyncio.to_thread(
                     client.chat.completions.create,
@@ -94,7 +103,7 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
             msg = response.choices[0].message
 
             if msg.tool_calls:
-                messages.append(msg)
+                history.append(msg)
                 for tool_call in msg.tool_calls:
                     tool_name = tool_call.function.name
                     args = json.loads(tool_call.function.arguments)
@@ -109,7 +118,10 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
                     final_reward = data.get("reward", 0)
                     final_flags = obs.get("flags_found", [])
 
-                    messages.append({
+                    # Update state summary from latest observation
+                    latest_state_summary = obs.get("state_summary", latest_state_summary)
+
+                    history.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": obs["output"],
@@ -124,8 +136,8 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
             else:
                 content = msg.content or ""
                 print(f"  Step {step+1}: [text] {content[:80]}...")
-                messages.append(msg)
-                messages.append({"role": "user", "content": "Continue completing the remaining tasks. Use the tools available to you."})
+                history.append(msg)
+                history.append({"role": "user", "content": "Continue completing the remaining tasks. Use the tools available to you."})
 
         # Fetch final calendar
         calendar_lines = []
@@ -144,7 +156,7 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
 
         calendar = "\n".join(calendar_lines) if calendar_lines else "No events."
 
-    print(f"\n  REWARD: {final_reward:.2f} ({len(final_flags)}/11)")
+    print(f"\n  REWARD: {final_reward:.2f} ({len(final_flags)}/13)")
     print(f"  FLAGS: {sorted(final_flags)}")
     print(f"  STEPS: {steps_used}")
     print(f"  CALENDAR:\n{calendar}")
@@ -173,7 +185,7 @@ async def main():
     print(f"{'='*60}")
     for r in results:
         flags_count = len(r.get("flags", []))
-        print(f"  Seed {r['seed']:3d} | {r.get('date','?'):>10s} | Reward: {r.get('reward',0):.2f} ({flags_count}/11) | Steps: {r.get('steps','?')}")
+        print(f"  Seed {r['seed']:3d} | {r.get('date','?'):>10s} | Reward: {r.get('reward',0):.2f} ({flags_count}/13) | Steps: {r.get('steps','?')}")
 
     rewards = [r.get("reward", 0) for r in results]
     print(f"\n  Average reward: {sum(rewards)/len(rewards):.2f}")
