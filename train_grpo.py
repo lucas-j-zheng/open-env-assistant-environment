@@ -34,18 +34,18 @@ class Config:
     max_seq_len: int = 2048
 
     # GRPO
-    group_size: int = 2           # episodes per seed
-    seeds_per_iter: int = 1       # seeds per iteration
-    max_steps_per_episode: int = 25  # shorter episodes for speed
+    group_size: int = 4           # need >=4 for reward variance
+    seeds_per_iter: int = 1       # 1 seed, 4 episodes per iter
+    max_steps_per_episode: int = 20  # shorter to compensate
 
     # Training
-    num_iterations: int = 30
-    lr: float = 1e-5
+    num_iterations: int = 20
+    lr: float = 5e-5
     max_grad_norm: float = 1.0
     ppo_epochs: int = 1
 
     # Generation
-    temperature: float = 0.7
+    temperature: float = 0.9
     max_new_tokens: int = 128
 
     # Checkpointing
