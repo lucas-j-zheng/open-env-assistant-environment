@@ -13,7 +13,10 @@ except Exception as e:
         "openenv is required. Install with: uv pip install openenv-core"
     ) from e
 
-from models import CalendarAction, CalendarObservation
+try:
+    from ..models import CalendarAction, CalendarObservation
+except ImportError:
+    from models import CalendarAction, CalendarObservation
 from .personal_assistant_environment import PersonalAssistantEnvironment
 
 app = create_web_interface_app(
