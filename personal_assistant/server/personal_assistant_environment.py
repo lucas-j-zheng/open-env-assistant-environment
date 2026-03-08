@@ -26,6 +26,11 @@ try:
 except ImportError:
     from models import CalendarAction, CalendarObservation, CalendarState
 
+try:
+    from .seed_generator import generate_episode_config, EpisodeConfig
+except ImportError:
+    from seed_generator import generate_episode_config, EpisodeConfig
+
 
 class PersonalAssistantEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -122,7 +127,7 @@ class PersonalAssistantEnvironment(Environment):
         },
     }
 
-    _LUNCH_EXEMPT_IDS: set = {"seed2"}
+    _LUNCH_EXEMPT_IDS: set = {"seed2"}  # class-level default, overridden per episode
 
     # --- Ambiguous tasks ---
     TASKS = [
@@ -222,7 +227,10 @@ class PersonalAssistantEnvironment(Environment):
         self._seed: int = 0
         self._rng = random.Random(self._seed)
         self._episode_today: date = self.DEFAULT_EPISODE_BASE_DATE
-        self._state = CalendarState(episode_id=self._make_episode_id(), step_count=0, total_tasks=len(self.TASKS))
+        self._config = EpisodeConfig()
+        self._tasks = list(self.TASKS)
+        self._interrupts = list(self.INTERRUPTS)
+        self._state = CalendarState(episode_id=self._make_episode_id(), step_count=0, total_tasks=len(self._tasks))
 
     DAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
@@ -243,10 +251,13 @@ class PersonalAssistantEnvironment(Environment):
             for day in range(5):  # Mon=0..Fri=4
                 weekdays.append(self.DEFAULT_EPISODE_BASE_DATE + timedelta(weeks=week, days=day))
         self._episode_today = self._rng.choice(weekdays)
+        # Always consume RNG once for episode-id generation so downstream seed-based
+        # generation stays identical whether episode_id is caller-supplied or not.
+        generated_episode_id = self._make_episode_id()
         self._state = CalendarState(
-            episode_id=episode_id or self._make_episode_id(),
+            episode_id=episode_id or generated_episode_id,
             step_count=0,
-            total_tasks=len(self.TASKS),
+            total_tasks=len(self._tasks),
         )
 
     def _resolve_date(self, date_str: str) -> str:
@@ -575,7 +586,7 @@ class PersonalAssistantEnvironment(Environment):
 
     def tool_get_task_list(self) -> str:
         lines = ["Tasks to complete:"]
-        for i, t in enumerate(self.TASKS, 1):
+        for i, t in enumerate(self._tasks, 1):
             status = "DONE" if t["flag"] in self._found else "TODO"
             lines.append(f"  {i}. [{status}] {t['description']}")
         return "\n".join(lines)
@@ -737,7 +748,7 @@ class PersonalAssistantEnvironment(Environment):
 
     def _process_interrupts(self):
         step = self._state.step_count
-        for i, intr in enumerate(self.INTERRUPTS):
+        for i, intr in enumerate(self._interrupts):
             if intr["at_step"] == step and i not in self._fired_interrupts:
                 self._fired_interrupts.add(i)
                 if intr["type"] == "new_meeting":
@@ -841,12 +852,13 @@ class PersonalAssistantEnvironment(Environment):
         else:
             self._found.discard("reminder_set")
 
-        # meeting_cancelled: Old Project Review gone AND attendees notified
-        # Must notify at least one of the actual attendees (Alice, Bob, Charlie)
-        old_exists = any("old project review" in e.get("title", "").lower() for e in self._events)
+        # meeting_cancelled: cancellable meeting gone AND attendees notified
+        cancel_lower = self._config.cancellable_title.lower()
+        old_exists = any(cancel_lower in e.get("title", "").lower() for e in self._events)
+        valid_recipients = set(a.strip().title() for a in self._config.cancellable_attendees)
         attendees_notified = any(
-            n.get("to", "").strip().title() in ("Alice", "Bob", "Charlie")
-            and ("old project" in n.get("message", "").lower() or "cancel" in n.get("message", "").lower())
+            n.get("to", "").strip().title() in valid_recipients
+            and (cancel_lower.split()[0] in n.get("message", "").lower() or "cancel" in n.get("message", "").lower())
             for n in self._notifications
         )
         if not old_exists and attendees_notified:
@@ -869,13 +881,15 @@ class PersonalAssistantEnvironment(Environment):
             self._found.discard("ceo_sync_accommodated")
 
         # cancellation_handled
-        if 1 in self._fired_interrupts and not any("lunch with client" in e.get("title", "").lower() for e in self._events):
+        lunch_lower = self._config.lunch_meeting_title.lower()
+        if 1 in self._fired_interrupts and not any(lunch_lower in e.get("title", "").lower() for e in self._events):
             self._found.add("cancellation_handled")
         else:
             self._found.discard("cancellation_handled")
 
-        # reschedule_handled: Morning Sync moved to 11:00 (direct request, no schedule check)
-        if 2 in self._fired_interrupts and any("morning sync" in e.get("title", "").lower() and e.get("start_time") == "11:00" for e in self._events):
+        # reschedule_handled: morning meeting moved to 11:00 (direct request, no schedule check)
+        morning_lower = self._config.morning_meeting_title.lower()
+        if 2 in self._fired_interrupts and any(morning_lower in e.get("title", "").lower() and e.get("start_time") == "11:00" for e in self._events):
             self._found.add("reschedule_handled")
         else:
             self._found.discard("reschedule_handled")
@@ -940,12 +954,37 @@ class PersonalAssistantEnvironment(Environment):
 
     def _seed_initial_events(self):
         today = self._resolve_date("today")
-        self._events = [
-            {"id": "seed1", "title": "Morning Sync", "date": today, "start_time": "10:00", "end_time": "10:30", "duration_minutes": 30, "attendees": ["Alice", "Charlie"]},
-            {"id": "seed2", "title": "Lunch with Client", "date": today, "start_time": "12:00", "end_time": "13:00", "duration_minutes": 60, "attendees": ["Dave"]},
-            {"id": "seed3", "title": "Old Project Review", "date": today, "start_time": "14:00", "end_time": "15:00", "duration_minutes": 60, "attendees": ["Alice", "Bob", "Charlie"]},
-            {"id": "seed4", "title": "Design Review", "date": today, "start_time": "14:30", "end_time": "15:30", "duration_minutes": 60, "attendees": ["Eve"]},
-        ]
+        self._config = generate_episode_config(self._rng, today)
+        self._events = [e.copy() for e in self._config.initial_events]
+        self._LUNCH_EXEMPT_IDS = self._config.lunch_exempt_ids
+
+        # Build instance-level tasks with dynamic titles
+        self._tasks = [dict(t) for t in self.TASKS]
+        for t in self._tasks:
+            if t["flag"] == "meeting_cancelled":
+                t["description"] = f"The '{self._config.cancellable_title}' is no longer needed. Handle it and let the team know"
+            elif t["flag"] == "cancellation_handled":
+                t["description"] = f"[DYNAMIC] Handle Dave's cancellation of '{self._config.lunch_meeting_title}' — re-use the freed slot or acknowledge"
+            elif t["flag"] == "reschedule_handled":
+                t["description"] = f"[DYNAMIC] Reschedule '{self._config.morning_meeting_title}' to 11:00 AM as Alice requested"
+
+        # Build instance-level interrupts with dynamic titles
+        self._interrupts = []
+        for intr in self.INTERRUPTS:
+            intr_copy = dict(intr)
+            if intr_copy["type"] == "cancellation":
+                intr_copy["cancel_title"] = self._config.lunch_meeting_title
+                intr_copy["message"] = (
+                    f"UPDATE: Dave just cancelled '{self._config.lunch_meeting_title}'. "
+                    f"The 12:00-13:00 slot is now free. Consider using it for any pending tasks that need a time slot."
+                )
+            elif intr_copy["type"] == "reschedule_request":
+                intr_copy["event_title"] = self._config.morning_meeting_title
+                intr_copy["message"] = (
+                    f"REQUEST: Alice asks to move '{self._config.morning_meeting_title}' "
+                    f"to 11:00 AM. Please reschedule it and confirm there are no new conflicts."
+                )
+            self._interrupts.append(intr_copy)
 
     def reset(self, seed: Optional[int] = None, episode_id: Optional[str] = None, **kwargs) -> CalendarObservation:
         self._found = set()
@@ -961,19 +1000,20 @@ class PersonalAssistantEnvironment(Environment):
         self._check_completions()
 
         new_flags = len(self._found)
-        reward = new_flags / len(self.TASKS)
-        done = new_flags == len(self.TASKS)
+        reward = new_flags / len(self._tasks)
+        done = new_flags == len(self._tasks)
         self._state.tasks_completed = new_flags
 
+        event_count = len([e for e in self._events if e["date"] == self._resolve_date("today")])
         return CalendarObservation(
-            output="Calendar assistant ready. You have 4 events today including a scheduling conflict. "
+            output=f"Calendar assistant ready. You have {event_count} events today including a scheduling conflict. "
                    "There are also person-specific constraints and preferences to satisfy. "
                    "Use get_task_list to see what needs to be done, get_constraints for general rules, "
                    "get_contact_preferences to learn about individual people's needs, "
                    "and check_availability to look up people's schedules before booking. "
                    "Warning: new requests may arrive while you work — stay alert and adapt. "
                    "Note: Attendees may push back on meeting invites — be prepared to adapt your proposals.",
-            pending_tasks=len(self.TASKS) - new_flags,
+            pending_tasks=len(self._tasks) - new_flags,
             events_today=len([e for e in self._events if e["date"] == self._resolve_date("today")]),
             metadata={"seed": self._seed, "episode_today": self._resolve_date("today")},
             flags_found=list(self._found), done=done, reward=reward,
@@ -1011,12 +1051,12 @@ class PersonalAssistantEnvironment(Environment):
             output += self._pending_interrupt_msg
 
         new_flags = len(self._found)
-        reward = new_flags / len(self.TASKS)
-        done = new_flags == len(self.TASKS)
+        reward = new_flags / len(self._tasks)
+        done = new_flags == len(self._tasks)
         self._state.tasks_completed = new_flags
 
         return CalendarObservation(
-            output=output, pending_tasks=len(self.TASKS) - new_flags,
+            output=output, pending_tasks=len(self._tasks) - new_flags,
             events_today=len([e for e in self._events if e["date"] == self._resolve_date("today")]),
             metadata={"seed": self._seed, "episode_today": self._resolve_date("today")},
             flags_found=list(self._found), reward=reward, done=done,
