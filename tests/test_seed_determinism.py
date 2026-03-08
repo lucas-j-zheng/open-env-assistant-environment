@@ -42,15 +42,16 @@ def test_seed_reproducible_even_with_custom_episode_id():
     assert snap_custom == snap_default
 
 
-def test_seed_generator_starts_with_single_intended_conflict():
+def test_seed_generator_starts_with_at_least_one_work_conflict():
+    """Work events seed3 and seed4 always overlap. Personal events may add more overlaps."""
     for seed in range(50):
         env = PersonalAssistantEnvironment()
         env.reset(seed=seed)
         today = env._resolve_date("today")
-        day_events = [e for e in env._events if e["date"] == today]
-        overlaps = 0
-        for i, left in enumerate(day_events):
-            for right in day_events[i + 1:]:
+        work_events = [e for e in env._events if e["date"] == today and e.get("type") != "personal"]
+        work_overlaps = 0
+        for i, left in enumerate(work_events):
+            for right in work_events[i + 1:]:
                 if left["start_time"] < right["end_time"] and left["end_time"] > right["start_time"]:
-                    overlaps += 1
-        assert overlaps == 1, f"seed={seed} has {overlaps} initial overlaps"
+                    work_overlaps += 1
+        assert work_overlaps >= 1, f"seed={seed} has {work_overlaps} work-only overlaps (expected >=1)"

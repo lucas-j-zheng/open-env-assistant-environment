@@ -18,22 +18,26 @@ EPISODE_BASE_DATE = date(2026, 1, 5)
 EPISODE_WEEKS = 3
 MAX_STEPS = 60
 
-SYSTEM_PROMPT = """You are a calendar personal assistant. You have access to tools to manage a calendar.
+SYSTEM_PROMPT = """You are a calendar personal assistant managing a team's calendar.
 
-Your goal is to complete ALL tasks on the task list. Start by calling get_task_list to see what needs to be done, then use the available tools to complete each task.
+Start by reading your inbox (read_inbox) and reviewing the calendar (list_events) to understand what needs to be done today.
 
 IMPORTANT workflow:
-1. First call get_task_list and get_constraints to understand the general rules.
-2. BEFORE scheduling any meeting with someone, call get_contact_preferences(person) to discover their private constraints and preferences. Not all constraints are visible in get_constraints.
-3. Use check_availability before scheduling — don't guess times.
-4. When scheduling, respect HARD constraints (must obey) and SOFT constraints (preferences).
-5. After making changes, call check_constraint_violations to catch any violations.
-6. Periodically call get_task_list to check which tasks are still TODO.
-7. The "preferences_optimized" task requires soft constraints to be satisfied. If you see soft violations, fix them.
-8. Think step by step about what tools to call and in what order.
-9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters.
-10. Pay attention to policy changes announced via interrupts. Rules may change mid-session — tools and constraints that worked before may behave differently after an update. Re-check constraints after any policy announcement.
-11. If someone's availability changes, re-validate any meetings you already scheduled with that person."""
+1. Read your inbox to see pending requests from your boss and team.
+2. Review the calendar to understand the current schedule.
+3. BEFORE scheduling any meeting, call get_contact_preferences(person) to learn their constraints.
+4. Use check_availability before scheduling — don't guess times.
+5. Respect HARD constraints (must obey) and SOFT constraints (preferences).
+6. After making changes, call check_constraint_violations to verify.
+7. Keep checking your inbox — new messages may arrive while you work.
+8. When attendees decline a meeting, read their feedback and adjust your proposal.
+9. Personal events on the calendar are immovable — schedule work around them.
+10. Reply to messages that need responses.
+11. Inbox-driven requests are tracked in the inbox; if any task-style view omits them, use read_inbox as the source of truth.
+12. Think step by step about what tools to call and in what order.
+13. Pay attention to policy changes announced via interrupts. Rules may change mid-session.
+14. If someone's availability changes, re-validate any meetings you already scheduled with that person.
+15. Family may text mid-session about personal event changes. Re-check for new conflicts."""
 
 TOOLS = [
     {"type": "function", "function": {"name": "list_events", "description": "List all calendar events for a given date.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "description": "Date string: 'today', 'tomorrow', 'next monday', or YYYY-MM-DD"}}, "required": []}}},
@@ -44,11 +48,13 @@ TOOLS = [
     {"type": "function", "function": {"name": "check_conflicts", "description": "Check for scheduling conflicts on a date.", "parameters": {"type": "object", "properties": {"date": {"type": "string", "default": "today"}}, "required": []}}},
     {"type": "function", "function": {"name": "resolve_conflict", "description": "Resolve a conflict by moving an event to a new time.", "parameters": {"type": "object", "properties": {"event_title": {"type": "string"}, "new_start_time": {"type": "string", "description": "HH:MM format"}}, "required": ["event_title", "new_start_time"]}}},
     {"type": "function", "function": {"name": "send_notification", "description": "Send a notification to a person.", "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "message": {"type": "string"}}, "required": ["to", "message"]}}},
-    {"type": "function", "function": {"name": "get_task_list", "description": "Get the list of tasks to complete.", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {"name": "check_availability", "description": "Check a person's availability on a given date.", "parameters": {"type": "object", "properties": {"person": {"type": "string"}, "date": {"type": "string", "default": "today"}}, "required": ["person"]}}},
     {"type": "function", "function": {"name": "get_constraints", "description": "Get scheduling constraints (hard and soft) that apply to the calendar. Note: individual people may have additional private constraints — use get_contact_preferences to discover them.", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {"name": "get_contact_preferences", "description": "Get a person's scheduling preferences, private constraints, role, and preferred notification method. Some constraints are only visible through this tool.", "parameters": {"type": "object", "properties": {"person": {"type": "string", "description": "Person's name (e.g. Alice, Bob, Charlie, Dave, Eve)"}}, "required": ["person"]}}},
     {"type": "function", "function": {"name": "check_constraint_violations", "description": "Check the current calendar for all constraint violations.", "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {"name": "read_inbox", "description": "List inbox messages, filtered by all/unread/unreplied.", "parameters": {"type": "object", "properties": {"status": {"type": "string", "description": "Filter: 'all', 'unread', or 'unreplied'", "default": "all"}}, "required": []}}},
+    {"type": "function", "function": {"name": "reply_message", "description": "Reply to an inbox message. Reply must address the sender's concern.", "parameters": {"type": "object", "properties": {"message_id": {"type": "string", "description": "ID of the message to reply to"}, "reply": {"type": "string", "description": "Your reply text (min 20 chars, must address the sender's ask)"}}, "required": ["message_id", "reply"]}}},
+    {"type": "function", "function": {"name": "check_personal_calendar", "description": "Show personal (immovable) events that cannot be moved or deleted.", "parameters": {"type": "object", "properties": {}, "required": []}}},
 ]
 
 
@@ -77,6 +83,7 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
         SLIDING_WINDOW = 6
         history = []
         latest_state_summary = obs.get("state_summary", obs["output"])
+        total_tasks = len(obs.get("flags_found", [])) + obs.get("pending_tasks", 0)
 
         final_reward = 0
         final_flags = []
@@ -117,6 +124,7 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
                     obs = data["observation"]
                     final_reward = data.get("reward", 0)
                     final_flags = obs.get("flags_found", [])
+                    total_tasks = len(final_flags) + obs.get("pending_tasks", 0)
 
                     # Update state summary from latest observation
                     latest_state_summary = obs.get("state_summary", latest_state_summary)
@@ -156,12 +164,19 @@ async def run_seed(client: OpenAI, seed: int) -> dict:
 
         calendar = "\n".join(calendar_lines) if calendar_lines else "No events."
 
-    print(f"\n  REWARD: {final_reward:.2f} ({len(final_flags)}/13)")
+    print(f"\n  REWARD: {final_reward:.2f} ({len(final_flags)}/{total_tasks})")
     print(f"  FLAGS: {sorted(final_flags)}")
     print(f"  STEPS: {steps_used}")
     print(f"  CALENDAR:\n{calendar}")
 
-    return {"seed": seed, "date": episode_today, "reward": final_reward, "flags": sorted(final_flags), "steps": steps_used}
+    return {
+        "seed": seed,
+        "date": episode_today,
+        "reward": final_reward,
+        "flags": sorted(final_flags),
+        "steps": steps_used,
+        "total_tasks": total_tasks,
+    }
 
 
 async def main():
@@ -185,7 +200,8 @@ async def main():
     print(f"{'='*60}")
     for r in results:
         flags_count = len(r.get("flags", []))
-        print(f"  Seed {r['seed']:3d} | {r.get('date','?'):>10s} | Reward: {r.get('reward',0):.2f} ({flags_count}/13) | Steps: {r.get('steps','?')}")
+        total_tasks = r.get("total_tasks", "?")
+        print(f"  Seed {r['seed']:3d} | {r.get('date','?'):>10s} | Reward: {r.get('reward',0):.2f} ({flags_count}/{total_tasks}) | Steps: {r.get('steps','?')}")
 
     rewards = [r.get("reward", 0) for r in results]
     print(f"\n  Average reward: {sum(rewards)/len(rewards):.2f}")

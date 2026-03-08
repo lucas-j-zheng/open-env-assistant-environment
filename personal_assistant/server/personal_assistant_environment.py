@@ -148,6 +148,11 @@ class PersonalAssistantEnvironment(Environment):
         {"description": "Optimize the schedule so that as many soft constraints (preferences) as possible are satisfied", "flag": "preferences_optimized"},
         {"description": "[DYNAMIC] Re-validate schedule after Bob's Wednesday availability changed", "flag": "availability_drift_handled"},
         {"description": "[DYNAMIC] Ensure all meetings comply with the description/agenda policy", "flag": "description_policy_met"},
+        {"description": "Read and reply to all inbox messages appropriately", "flag": "inbox_cleared"},
+        {"description": "Reply diplomatically to the tough email in your inbox", "flag": "diplomatic_reply_sent"},
+        {"description": "[DYNAMIC] Handle the updated/contradicting message from the client", "flag": "client_request_updated"},
+        {"description": "Resolve conflicts between personal and work events — personal events cannot be moved", "flag": "work_life_conflicts_resolved"},
+        {"description": "[DYNAMIC] Adjust calendar after personal event time change", "flag": "personal_update_handled"},
     ]
 
     INTERRUPTS = [
@@ -170,6 +175,14 @@ class PersonalAssistantEnvironment(Environment):
             "new_blocks": {"wednesday": [("13:00", "17:00")]},
             "message": "UPDATE from Bob: \"I'm now unavailable Wednesday afternoons (1 PM onwards) "
                        "due to a recurring client engagement. Please update anything that conflicts.\"",
+        },
+        {
+            "at_step": 5, "type": "inbox_update",
+            "message": "NEW MESSAGE: You've received a follow-up that changes an earlier request. Check your inbox.",
+        },
+        {
+            "at_step": 10, "type": "personal_event_change",
+            "message": "TEXT from partner: \"Dinner has been moved earlier. Please adjust your schedule.\"",
         },
         {
             "at_step": 12, "type": "policy_change",
@@ -251,6 +264,7 @@ class PersonalAssistantEnvironment(Environment):
         self._negotiation_feedback: dict[str, str] = {}  # scenario_id -> last rejection msg
         self._attendee_schedules = copy.deepcopy(self.ATTENDEE_SCHEDULES)
         self._description_policy_active = False
+        self._inbox: list[dict] = []
         self._seed: int = 0
         self._rng = random.Random(self._seed)
         self._episode_today: date = self.DEFAULT_EPISODE_BASE_DATE
@@ -379,6 +393,8 @@ class PersonalAssistantEnvironment(Environment):
         elif name == "long_meetings_need_description":
             if self._description_policy_active:
                 for e in self._events:
+                    if e.get("type") == "personal":
+                        continue  # Personal events exempt from description policy
                     if e.get("duration_minutes", 0) > 30 and not e.get("description", ""):
                         violations.append({"constraint": name, "event": e["title"], "detail": f"'{e['title']}' is {e['duration_minutes']}min with no description/agenda"})
         return violations
@@ -541,7 +557,8 @@ class PersonalAssistantEnvironment(Environment):
             return f"No events scheduled for {target}."
         lines = [f"Events for {target}:"]
         for e in sorted(day_events, key=lambda x: x["start_time"]):
-            lines.append(f"  - {e['title']} | {e['start_time']}-{e['end_time']} | Attendees: {', '.join(e.get('attendees', []))}")
+            tag = "[PERSONAL]" if e.get("type") == "personal" else "[WORK]"
+            lines.append(f"  - {tag} {e['title']} | {e['start_time']}-{e['end_time']} | Attendees: {', '.join(e.get('attendees', []))}")
         return "\n".join(lines)
 
     def tool_create_event(self, title: str, date: str, start_time: str, duration_minutes: int = 60, attendees: str = "", description: str = "") -> str:
@@ -574,8 +591,17 @@ class PersonalAssistantEnvironment(Environment):
         matches = [e for e in self._events if e["title"].lower() == title.lower()]
         if not matches:
             return f"No event found with title '{title}'."
-        for m in matches:
+        movable_matches = [m for m in matches if not m.get("immovable")]
+        if not movable_matches:
+            return f"Cannot delete '{title}' — this is a personal/immovable event. Adjust work events instead."
+        for m in movable_matches:
             self._events.remove(m)
+        immovable_kept = len(matches) - len(movable_matches)
+        if immovable_kept > 0:
+            return (
+                f"Deleted {len(movable_matches)} event(s) titled '{title}'. "
+                f"Kept {immovable_kept} personal/immovable event(s)."
+            )
         return f"Deleted event '{title}'."
 
     def tool_find_free_slots(self, date: str = "today", duration_minutes: int = 60) -> str:
@@ -609,6 +635,8 @@ class PersonalAssistantEnvironment(Environment):
         if not matches:
             return f"No event found with title '{event_title}'."
         event = matches[0]
+        if event.get("immovable"):
+            return f"Cannot move '{event_title}' — this is a personal/immovable event. Adjust work events instead."
         event["start_time"] = new_start_time
         event["end_time"] = (datetime.strptime(f"{event['date']} {new_start_time}", "%Y-%m-%d %H:%M") + timedelta(minutes=event["duration_minutes"])).strftime("%H:%M")
         warnings = []
@@ -625,11 +653,31 @@ class PersonalAssistantEnvironment(Environment):
         self._notifications.append({"to": to, "message": message})
         return f"Notification sent to {to}: {message}"
 
+    def _visible_inbox_driven_flags(self) -> set[str]:
+        current_step = self._state.step_count
+        return {
+            str(m.get("driven_flag"))
+            for m in self._inbox
+            if m.get("received_at_step", 0) <= current_step and m.get("driven_flag")
+        }
+
     def tool_get_task_list(self) -> str:
+        inbox_flags = self._visible_inbox_driven_flags()
         lines = ["Tasks to complete:"]
-        for i, t in enumerate(self._tasks, 1):
+        shown = 0
+        for t in self._tasks:
+            if t["flag"] in inbox_flags:
+                continue
+            shown += 1
             status = "DONE" if t["flag"] in self._found else "TODO"
-            lines.append(f"  {i}. [{status}] {t['description']}")
+            lines.append(f"  {shown}. [{status}] {t['description']}")
+        hidden_todo = sum(1 for t in self._tasks if t["flag"] in inbox_flags and t["flag"] not in self._found)
+        if inbox_flags:
+            lines.append("")
+            lines.append(
+                f"Inbox-driven requests hidden from this list: {hidden_todo} TODO "
+                f"({len(inbox_flags)} total tracked via inbox). Use read_inbox for details."
+            )
         return "\n".join(lines)
 
     def tool_check_availability(self, person: str, date: str = "today") -> str:
@@ -684,6 +732,8 @@ class PersonalAssistantEnvironment(Environment):
         if not matches:
             return f"No event found with title '{title}'."
         event = matches[0]
+        if event.get("immovable"):
+            return f"Cannot modify '{title}' — this is a personal/immovable event. Adjust work events instead."
         changes = []
         if new_title:
             changes.append(f"title: '{event['title']}' → '{new_title}'")
@@ -789,10 +839,9 @@ class PersonalAssistantEnvironment(Environment):
         ]
 
         # --- Task status ---
-        done_flags = sorted(self._found)
-        todo_flags = [t["flag"] for t in self._tasks if t["flag"] not in self._found]
-        lines.append(f"Completed: {done_flags} ({len(done_flags)}/{len(self._tasks)})")
-        lines.append(f"Pending: {todo_flags}")
+        done_count = len(self._found)
+        total_count = len(self._tasks)
+        lines.append(f"Progress: {done_count}/{total_count} objectives completed")
         lines.append("")
 
         # --- Calendar snapshot (grouped by date) ---
@@ -808,7 +857,8 @@ class PersonalAssistantEnvironment(Environment):
                 for e in sorted(events_by_date[d], key=lambda x: x["start_time"]):
                     att = ", ".join(e.get("attendees", [])) or "(none)"
                     desc_marker = " [has agenda]" if e.get("description") else ""
-                    lines.append(f"  [{day_label}] {e['title']} | {e['start_time']}-{e['end_time']} | {att}{desc_marker}")
+                    type_tag = "[PERSONAL]" if e.get("type") == "personal" else "[WORK]"
+                    lines.append(f"  [{day_label}] {type_tag} {e['title']} | {e['start_time']}-{e['end_time']} | {att}{desc_marker}")
         lines.append("")
 
         # --- Known preferences (only what agent has queried) ---
@@ -877,6 +927,60 @@ class PersonalAssistantEnvironment(Environment):
             lines.append("Active Policies: description_required (meetings >30min need agenda)")
             lines.append("")
 
+        # --- Inbox status ---
+        visible_msgs = [m for m in self._inbox if m.get("received_at_step", 0) <= self._state.step_count]
+        if visible_msgs:
+            lines.append("Inbox:")
+            for m in visible_msgs:
+                status = "REPLIED" if m.get("replied") else ("READ" if m.get("read") else "UNREAD")
+                lines.append(f"  [{m['id']}] {m['from']}: {m['subject']} [{status}]")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def tool_read_inbox(self, status: str = "all") -> str:
+        """List inbox messages, filtered by all/unread/unreplied."""
+        current_step = self._state.step_count
+        visible = [m for m in self._inbox if m.get("received_at_step", 0) <= current_step]
+        if status == "unread":
+            visible = [m for m in visible if not m.get("read")]
+        elif status == "unreplied":
+            visible = [m for m in visible if not m.get("replied")]
+        if not visible:
+            return f"No {status} messages in inbox."
+        lines = [f"Inbox ({status}):"]
+        for m in visible:
+            m["read"] = True
+            reply_status = "REPLIED" if m.get("replied") else "NEEDS REPLY"
+            lines.append(f"  [{m['id']}] From: {m['from']} | Subject: {m['subject']} | Status: {reply_status}")
+            lines.append(f"    {m['body']}")
+        return "\n".join(lines)
+
+    def tool_reply_message(self, message_id: str, reply: str) -> str:
+        """Reply to an inbox message."""
+        msg = next((m for m in self._inbox if m["id"] == message_id), None)
+        if not msg:
+            return f"No message found with id '{message_id}'. Use read_inbox to see available messages."
+        if msg.get("received_at_step", 0) > self._state.step_count:
+            return f"Message '{message_id}' has not been received yet."
+        if len(reply) < 20:
+            return f"Reply too short (minimum 20 characters). The sender ({msg['from']}) expects a substantive response about: {msg['core_ask']}"
+        keywords = msg.get("reply_keywords", [])
+        if not any(kw.lower() in reply.lower() for kw in keywords):
+            return (f"Reply doesn't address the sender's concern. {msg['from']} asked about: {msg['core_ask']}. "
+                    f"Try including relevant details in your response.")
+        msg["replied"] = True
+        msg["reply_text"] = reply
+        return f"Reply sent to {msg['from']} for '{msg['subject']}'."
+
+    def tool_check_personal_calendar(self) -> str:
+        """Show personal (immovable) events."""
+        personal = [e for e in self._events if e.get("type") == "personal"]
+        if not personal:
+            return "No personal events on the calendar."
+        lines = ["Personal Calendar:"]
+        for e in sorted(personal, key=lambda x: (x["date"], x["start_time"])):
+            lines.append(f"  [IMMOVABLE] {e['title']} | {e['date']} {e['start_time']}-{e['end_time']}")
         return "\n".join(lines)
 
     TOOL_MAP = {
@@ -893,6 +997,9 @@ class PersonalAssistantEnvironment(Environment):
         "get_constraints": "tool_get_constraints",
         "get_contact_preferences": "tool_get_contact_preferences",
         "check_constraint_violations": "tool_check_constraint_violations",
+        "read_inbox": "tool_read_inbox",
+        "reply_message": "tool_reply_message",
+        "check_personal_calendar": "tool_check_personal_calendar",
     }
 
     def _dispatch_tool(self, tool_name: str, arguments: dict) -> str:
@@ -918,6 +1025,10 @@ class PersonalAssistantEnvironment(Environment):
             return "availability_drift_handled" in self._found
         if intr_type == "policy_change":
             return "description_policy_met" in self._found
+        if intr_type == "inbox_update":
+            return "client_request_updated" in self._found
+        if intr_type == "personal_event_change":
+            return "personal_update_handled" in self._found
         return False
 
     def _refresh_unhandled_interrupts(self):
@@ -964,6 +1075,25 @@ class PersonalAssistantEnvironment(Environment):
                         self._description_policy_active = True
                     self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}"
                     self._unhandled_interrupts[i] = intr["message"]
+                elif intr["type"] == "inbox_update":
+                    if self._config.mid_episode_message:
+                        self._inbox.append(self._config.mid_episode_message.copy())
+                    self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{intr['message']}"
+                    self._unhandled_interrupts[i] = intr["message"]
+                elif intr["type"] == "personal_event_change":
+                    update = self._config.personal_event_update
+                    if update:
+                        for e in self._events:
+                            if e.get("id") == update.get("event_id"):
+                                e["start_time"] = update["new_start_time"]
+                                e["end_time"] = update["new_end_time"]
+                                break
+                    # Update message with actual time
+                    msg = intr["message"]
+                    if update:
+                        msg = f"TEXT from partner: \"Plans changed — now at {update['new_start_time']}. Please adjust your schedule.\""
+                    self._pending_interrupt_msg = f"\n\n--- INTERRUPT ---\n{msg}"
+                    self._unhandled_interrupts[i] = msg
 
     # --- Completion checking (outcome-based) ---
 
@@ -1177,6 +1307,8 @@ class PersonalAssistantEnvironment(Environment):
         if self._description_policy_active:
             desc_ok = True
             for e in self._events:
+                if e.get("type") == "personal":
+                    continue  # Personal events exempt
                 if e.get("duration_minutes", 0) > 30 and not e.get("description", ""):
                     desc_ok = False
                     break
@@ -1185,10 +1317,72 @@ class PersonalAssistantEnvironment(Environment):
             else:
                 self._found.discard("description_policy_met")
 
+        # inbox_cleared: All visible messages have been replied to (revocable)
+        visible_msgs = [m for m in self._inbox if m.get("received_at_step", 0) <= self._state.step_count]
+        if visible_msgs and all(m.get("replied") for m in visible_msgs):
+            self._found.add("inbox_cleared")
+        else:
+            self._found.discard("inbox_cleared")
+
+        # diplomatic_reply_sent: The diplomatic message has been replied to
+        diplomatic_msgs = [m for m in self._inbox if m.get("type") == "diplomatic"]
+        if diplomatic_msgs and any(m.get("replied") for m in diplomatic_msgs):
+            self._found.add("diplomatic_reply_sent")
+        else:
+            self._found.discard("diplomatic_reply_sent")
+
+        # client_request_updated: After inbox_update interrupt fires, the contradiction message has been replied to
+        inbox_update_idx = next((i for i, intr in enumerate(self._interrupts) if intr.get("type") == "inbox_update"), None)
+        if inbox_update_idx is not None and inbox_update_idx in self._fired_interrupts:
+            contra_msgs = [m for m in self._inbox if m.get("id") == "msg_contra"]
+            if contra_msgs and contra_msgs[0].get("replied"):
+                self._found.add("client_request_updated")
+            else:
+                self._found.discard("client_request_updated")
+
+        # work_life_conflicts_resolved: No personal event overlaps any work event on the same date (revocable)
+        personal_events = [e for e in self._events if e.get("type") == "personal"]
+        work_events = [e for e in self._events if e.get("type") != "personal"]
+        wl_conflict = False
+        for pe in personal_events:
+            for we in work_events:
+                if pe["date"] == we["date"] and pe["start_time"] < we["end_time"] and pe["end_time"] > we["start_time"]:
+                    wl_conflict = True
+                    break
+            if wl_conflict:
+                break
+        if personal_events and not wl_conflict:
+            self._found.add("work_life_conflicts_resolved")
+        else:
+            self._found.discard("work_life_conflicts_resolved")
+
+        # personal_update_handled: After personal_event_change interrupt fires, no overlaps with changed personal event (revocable)
+        personal_change_idx = next((i for i, intr in enumerate(self._interrupts) if intr.get("type") == "personal_event_change"), None)
+        if personal_change_idx is not None and personal_change_idx in self._fired_interrupts:
+            update = self._config.personal_event_update
+            if update:
+                changed_event = next((e for e in self._events if e.get("id") == update.get("event_id")), None)
+                if changed_event:
+                    has_overlap = any(
+                        we["date"] == changed_event["date"] and
+                        changed_event["start_time"] < we["end_time"] and
+                        changed_event["end_time"] > we["start_time"]
+                        for we in self._events if we.get("type") != "personal"
+                    )
+                    if not has_overlap:
+                        self._found.add("personal_update_handled")
+                    else:
+                        self._found.discard("personal_update_handled")
+
     def _seed_initial_events(self):
         today = self._resolve_date("today")
         self._config = generate_episode_config(self._rng, today)
         self._events = [e.copy() for e in self._config.initial_events]
+        for e in self._events:
+            e.setdefault("type", "work")
+        for pe in self._config.personal_events:
+            self._events.append(pe.copy())
+        self._inbox = [m.copy() for m in self._config.initial_messages]
         self._LUNCH_EXEMPT_IDS = self._config.lunch_exempt_ids
 
         # Build instance-level tasks with dynamic titles
@@ -1201,10 +1395,13 @@ class PersonalAssistantEnvironment(Environment):
             elif t["flag"] == "reschedule_handled":
                 t["description"] = f"[DYNAMIC] Reschedule '{self._config.morning_meeting_title}' to 11:00 AM as Alice requested"
 
-        # Build instance-level interrupts with dynamic titles
+        # Build instance-level interrupts with dynamic titles and randomized steps
         self._interrupts = []
         for intr in self.INTERRUPTS:
             intr_copy = dict(intr)
+            # Use randomized step from config if available
+            if self._config.interrupt_steps and intr_copy["type"] in self._config.interrupt_steps:
+                intr_copy["at_step"] = self._config.interrupt_steps[intr_copy["type"]]
             if intr_copy["type"] == "cancellation":
                 intr_copy["cancel_title"] = self._config.lunch_meeting_title
                 intr_copy["message"] = (
@@ -1234,6 +1431,7 @@ class PersonalAssistantEnvironment(Environment):
         self._negotiation_feedback = {}
         self._attendee_schedules = copy.deepcopy(self.ATTENDEE_SCHEDULES)
         self._description_policy_active = False
+        self._inbox = []
         self._set_episode_context(seed=seed, episode_id=episode_id)
         self._seed_initial_events()
         self._had_initial_conflicts = True
@@ -1242,13 +1440,9 @@ class PersonalAssistantEnvironment(Environment):
 
         event_count = len([e for e in self._events if e["date"] == self._resolve_date("today")])
         output = (
-            f"Calendar assistant ready. You have {event_count} events today including a scheduling conflict. "
-            "There are also person-specific constraints and preferences to satisfy. "
-            "Use get_task_list to see what needs to be done, get_constraints for general rules, "
-            "get_contact_preferences to learn about individual people's needs, "
-            "and check_availability to look up people's schedules before booking. "
-            "Warning: new requests may arrive while you work — stay alert and adapt. "
-            "Note: Attendees may push back on meeting invites — be prepared to adapt your proposals."
+            "Good morning. You're managing the team calendar today. "
+            "Check your inbox for requests and review the calendar. "
+            "New messages and updates may arrive throughout the day."
         )
         return self._build_observation(output)
 
@@ -1272,7 +1466,7 @@ class PersonalAssistantEnvironment(Environment):
         else:
             output = (
                 f"Received: '{instruction}'\nTo interact, send a JSON tool call like:\n"
-                f'{{"tool": "get_task_list", "args": {{}}}}\n'
+                f'{{"tool": "read_inbox", "args": {{}}}}\n'
                 f'{{"tool": "check_availability", "args": {{"person": "Alice", "date": "tuesday"}}}}\n'
                 f'{{"tool": "create_event", "args": {{"title": "Meeting", "date": "tomorrow", "start_time": "09:00", "duration_minutes": 30, "attendees": "Alice,Bob"}}}}\n'
                 f"Available tools: {', '.join(self.TOOL_MAP.keys())}"
@@ -1325,6 +1519,7 @@ class PersonalAssistantEnvironment(Environment):
             resolved_negotiations=dict(self._negotiation_resolved),
             unhandled_interrupts=list(self._pending_interrupt_msgs),
             notifications_sent=list(self._notifications),
+            inbox_snapshot=[{k: v for k, v in m.items()} for m in self._inbox if m.get("received_at_step", 0) <= self._state.step_count],
             step_count=self._state.step_count,
         )
 

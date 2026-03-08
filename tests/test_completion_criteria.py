@@ -17,6 +17,17 @@ def _step(env: PersonalAssistantEnvironment, tool: str | None = None, args: dict
     return env.step(CalendarAction(instruction=instruction))
 
 
+def _advance_to(env, target_step):
+    """Advance env to target_step by issuing no-op check_conflicts calls."""
+    while env._state.step_count < target_step:
+        _step(env, tool="check_conflicts")
+
+
+def _get_interrupt_step(env, interrupt_type):
+    """Get the actual step number for a given interrupt type."""
+    return env._config.interrupt_steps.get(interrupt_type)
+
+
 def _first_free_start(env: PersonalAssistantEnvironment, target_date: str, duration_minutes: int) -> str:
     day_events = sorted([e for e in env._events if e["date"] == target_date], key=lambda x: x["start_time"])
     current = datetime.strptime(f"{target_date} 08:00", "%Y-%m-%d %H:%M")
@@ -125,20 +136,39 @@ def test_interrupts_can_revoke_flags_on_non_tool_steps():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
     today = env._resolve_date("today")
-    conflict_title = env._config.cancellable_title
-    conflict_event = next(e for e in env._events if e["title"] == conflict_title)
-    move_to = _first_free_start(env, today, conflict_event["duration_minutes"])
 
-    # Resolve initial overlap first.
-    obs = _step(env, tool="resolve_conflict", args={"event_title": conflict_title, "new_start_time": move_to})
+    # Resolve ALL overlapping events today (work-work and work-personal).
+    for _ in range(10):
+        today_events = sorted(
+            [e for e in env._events if e["date"] == today],
+            key=lambda x: x["start_time"],
+        )
+        overlap_found = False
+        for i in range(len(today_events) - 1):
+            if today_events[i]["end_time"] > today_events[i + 1]["start_time"]:
+                # Move the work event (personal events are immovable)
+                to_move = today_events[i + 1] if today_events[i].get("type") == "personal" else today_events[i]
+                if to_move.get("immovable"):
+                    to_move = today_events[i] if today_events[i + 1].get("type") == "personal" else today_events[i + 1]
+                move_to = _first_free_start(env, today, to_move["duration_minutes"])
+                _step(env, tool="resolve_conflict", args={
+                    "event_title": to_move["title"],
+                    "new_start_time": move_to,
+                })
+                overlap_found = True
+                break
+        if not overlap_found:
+            break
+
+    obs = _step(env, tool="check_conflicts")
     assert "conflicts_resolved" in obs.flags_found
 
-    # Step 2 with a tool call keeps the flag.
-    obs = _step(env, tool="get_task_list", args={})
-    assert "conflicts_resolved" in obs.flags_found
+    # Advance to just before the new_meeting (CEO sync) interrupt step.
+    ceo_step = _get_interrupt_step(env, "new_meeting")
+    _advance_to(env, ceo_step - 1)
 
-    # Step 3 with plain text triggers CEO interrupt and can re-introduce a conflict.
-    # Completion checks must still run and revoke the flag.
+    # The next step triggers the CEO sync interrupt which injects a new event that
+    # can re-introduce a conflict. Plain text instruction still runs completions.
     obs = _step(env, instruction="hello")
     assert "conflicts_resolved" not in obs.flags_found
 
@@ -156,20 +186,29 @@ def test_reset_initializes_rewards_from_current_state():
     assert env.state.tasks_completed == expected_flags
 
     # A non-mutating first step should preserve reward/flags when no interrupts fire.
-    step_obs = _step(env, tool="get_task_list", args={})
+    step_obs = _step(env, tool="check_conflicts", args={})
     assert sorted(step_obs.flags_found) == sorted(obs.flags_found)
     assert step_obs.reward == obs.reward
     assert step_obs.pending_tasks == obs.pending_tasks
+
+
+def test_get_task_list_still_supported_for_compat():
+    env = PersonalAssistantEnvironment()
+    env.reset(seed=0)
+
+    obs = _step(env, tool="get_task_list", args={})
+    assert "Tasks to complete:" in obs.output
+    assert "[TODO]" in obs.output or "[DONE]" in obs.output
 
 
 def test_ceo_sync_accommodated_uses_any_qualifying_ceo_event():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    # Advance to step 3 so the CEO interrupt fires.
-    _step(env, tool="get_task_list", args={})
-    _step(env, tool="get_task_list", args={})
-    obs = _step(env, tool="get_task_list", args={})
+    # Advance to the new_meeting interrupt step so the CEO sync is injected.
+    ceo_step = _get_interrupt_step(env, "new_meeting")
+    _advance_to(env, ceo_step)
+    obs = _step(env, tool="check_conflicts", args={})
     assert "ceo_sync_accommodated" not in obs.flags_found
 
     # Make the original CEO event non-qualifying (16:00) and add another at 15:00.
@@ -203,5 +242,5 @@ def test_ceo_sync_accommodated_uses_any_qualifying_ceo_event():
         move_to = _first_free_start(env, today, blocker["duration_minutes"])
         _step(env, tool="resolve_conflict", args={"event_title": blocker["title"], "new_start_time": move_to})
 
-    obs = _step(env, tool="get_task_list", args={})
+    obs = _step(env, tool="check_conflicts", args={})
     assert "ceo_sync_accommodated" in obs.flags_found

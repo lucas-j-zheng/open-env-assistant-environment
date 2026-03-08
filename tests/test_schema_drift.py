@@ -19,9 +19,14 @@ def _step(env, tool=None, args=None, instruction=None):
 
 
 def _advance_to(env, target_step):
-    """Advance env to target_step by issuing no-op get_task_list calls."""
+    """Advance env to target_step by issuing no-op check_conflicts calls."""
     while env._state.step_count < target_step:
-        _step(env, tool="get_task_list")
+        _step(env, tool="check_conflicts")
+
+
+def _get_interrupt_step(env, interrupt_type):
+    """Get the actual step number for a given interrupt type."""
+    return env._config.interrupt_steps.get(interrupt_type)
 
 
 # ── Availability drift tests ──
@@ -31,10 +36,11 @@ def test_bob_availability_changes_at_step_7():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    # Before step 7, Bob's Wednesday has limited blocks
+    avail_step = _get_interrupt_step(env, "availability_change")
+    # Before the availability_change step, Bob's Wednesday has limited blocks
     before = list(env._attendee_schedules["Bob"]["wednesday"])
 
-    _advance_to(env, 7)
+    _advance_to(env, avail_step)
 
     after = env._attendee_schedules["Bob"]["wednesday"]
     assert len(after) > len(before), "Bob's Wednesday blocks should have grown"
@@ -46,10 +52,11 @@ def test_check_availability_returns_different_data_after_drift():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
+    avail_step = _get_interrupt_step(env, "availability_change")
     obs_before = _step(env, tool="check_availability", args={"person": "Bob", "date": "wednesday"})
     output_before = obs_before.output
 
-    _advance_to(env, 7)
+    _advance_to(env, avail_step)
 
     obs_after = _step(env, tool="check_availability", args={"person": "Bob", "date": "wednesday"})
     output_after = obs_after.output
@@ -62,6 +69,7 @@ def test_existing_bob_wednesday_event_invalidated():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
+    avail_step = _get_interrupt_step(env, "availability_change")
     # Create a Bob event on Wednesday at 14:00 (will conflict after drift)
     _step(env, tool="create_event", args={
         "title": "Bob Wednesday Meeting",
@@ -71,9 +79,9 @@ def test_existing_bob_wednesday_event_invalidated():
         "attendees": "Bob",
     })
 
-    _advance_to(env, 7)
+    _advance_to(env, avail_step)
 
-    obs = _step(env, tool="get_task_list")
+    obs = _step(env, tool="check_conflicts")
     assert "availability_drift_handled" not in obs.flags_found
 
 
@@ -82,6 +90,7 @@ def test_availability_drift_handled_flag():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
+    avail_step = _get_interrupt_step(env, "availability_change")
     # Create a Bob event on Wednesday afternoon
     _step(env, tool="create_event", args={
         "title": "Bob Wednesday Meeting",
@@ -91,10 +100,10 @@ def test_availability_drift_handled_flag():
         "attendees": "Bob",
     })
 
-    _advance_to(env, 7)
+    _advance_to(env, avail_step)
 
     # Flag should not be set yet
-    obs = _step(env, tool="get_task_list")
+    obs = _step(env, tool="check_conflicts")
     assert "availability_drift_handled" not in obs.flags_found
 
     # Fix: move event to morning
@@ -110,10 +119,11 @@ def test_availability_drift_flag_revocable():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    _advance_to(env, 7)
+    avail_step = _get_interrupt_step(env, "availability_change")
+    _advance_to(env, avail_step)
 
     # No Bob Wednesday events → flag should be set
-    obs = _step(env, tool="get_task_list")
+    obs = _step(env, tool="check_conflicts")
     assert "availability_drift_handled" in obs.flags_found
 
     # Create conflicting event
@@ -152,7 +162,8 @@ def test_constraint_totals_only_count_active_rules():
     before = _step(env, tool="check_constraint_violations")
     assert re.search(r"Hard constraints:\s+\d+/3 satisfied", before.output), before.output
 
-    _advance_to(env, 12)
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step)
     after = _step(env, tool="check_constraint_violations")
     assert re.search(r"Hard constraints:\s+\d+/4 satisfied", after.output), after.output
 
@@ -162,10 +173,10 @@ def test_unhandled_interrupt_clears_after_handling():
     env.reset(seed=0)
     lunch_title = env._config.lunch_meeting_title
 
-    # Advance to step 6 so cancellation interrupt fires.
-    for _ in range(5):
-        _step(env, tool="get_task_list")
-    obs = _step(env, tool="get_task_list")  # step 6
+    cancel_step = _get_interrupt_step(env, "cancellation")
+    # Advance to the cancellation step so the interrupt fires.
+    _advance_to(env, cancel_step - 1)
+    obs = _step(env, tool="check_conflicts")  # triggers cancellation
     assert any(lunch_title in msg for msg in obs.unhandled_interrupts)
 
     # Handle interruption by deleting the cancelled lunch meeting.
@@ -187,19 +198,21 @@ def test_hard_constraints_flip_after_policy():
         "duration_minutes": 60,
     })
 
-    # Advance past step 12
-    _advance_to(env, 12)
+    # Advance past the policy_change step
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step)
 
     obs = _step(env, tool="check_constraint_violations")
     assert "long_meetings_need_description" in obs.output or "no description" in obs.output.lower()
 
 
 def test_create_event_after_policy_with_description_ok():
-    """After step 12, creating >30min event WITH description → no violation for that event."""
+    """After policy_change, creating >30min event WITH description → no violation for that event."""
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    _advance_to(env, 12)
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step)
 
     obs = _step(env, tool="create_event", args={
         "title": "Described Meeting",
@@ -239,17 +252,18 @@ def test_description_policy_met_flag():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    _advance_to(env, 12)
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step)
 
-    # Add descriptions to all existing >30min events
-    for e in env._events:
-        if e.get("duration_minutes", 0) > 30 and not e.get("description", ""):
+    # Add descriptions to all existing >30min events (excluding personal events)
+    for e in list(env._events):
+        if e.get("duration_minutes", 0) > 30 and not e.get("description", "") and e.get("type") != "personal":
             _step(env, tool="edit_event", args={
                 "title": e["title"],
                 "new_description": "Agenda added",
             })
 
-    obs = _step(env, tool="get_task_list")
+    obs = _step(env, tool="check_conflicts")
     assert "description_policy_met" in obs.flags_found
 
 
@@ -258,17 +272,18 @@ def test_description_policy_met_revocable():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    _advance_to(env, 12)
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step)
 
-    # Fix all existing events
+    # Fix all existing events (excluding personal events)
     for e in list(env._events):
-        if e.get("duration_minutes", 0) > 30 and not e.get("description", ""):
+        if e.get("duration_minutes", 0) > 30 and not e.get("description", "") and e.get("type") != "personal":
             _step(env, tool="edit_event", args={
                 "title": e["title"],
                 "new_description": "Agenda",
             })
 
-    obs = _step(env, tool="get_task_list")
+    obs = _step(env, tool="check_conflicts")
     assert "description_policy_met" in obs.flags_found
 
     # Create new long event without description
@@ -288,10 +303,11 @@ def test_get_constraints_shows_new_rule_after_policy():
 
     obs_before = _step(env, tool="get_constraints")
 
-    _advance_to(env, 12)
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step)
 
     obs_after = _step(env, tool="get_constraints")
-    assert "description" not in obs_before.output.lower() or "agenda" not in obs_before.output.lower()
+    assert "description" not in obs_before.output.lower() and "agenda" not in obs_before.output.lower()
     assert "description" in obs_after.output.lower() or "agenda" in obs_after.output.lower()
 
 
@@ -300,14 +316,14 @@ def test_interrupt_messages_appear():
     env = PersonalAssistantEnvironment()
     env.reset(seed=0)
 
-    # Step to 7
-    _advance_to(env, 6)
-    obs = _step(env, tool="get_task_list")  # step 7
+    avail_step = _get_interrupt_step(env, "availability_change")
+    _advance_to(env, avail_step - 1)
+    obs = _step(env, tool="check_conflicts")  # triggers availability_change
     assert "INTERRUPT" in obs.output
     assert "Bob" in obs.output
 
-    # Step to 12
-    _advance_to(env, 11)
-    obs = _step(env, tool="get_task_list")  # step 12
+    policy_step = _get_interrupt_step(env, "policy_change")
+    _advance_to(env, policy_step - 1)
+    obs = _step(env, tool="check_conflicts")  # triggers policy_change
     assert "INTERRUPT" in obs.output
     assert "description" in obs.output.lower() or "agenda" in obs.output.lower()

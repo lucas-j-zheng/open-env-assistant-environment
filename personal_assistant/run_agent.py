@@ -59,6 +59,7 @@ TOOLS = [
                     "start_time": {"type": "string", "description": "HH:MM format"},
                     "duration_minutes": {"type": "integer", "default": 60},
                     "attendees": {"type": "string", "description": "Comma-separated names"},
+                    "description": {"type": "string", "description": "Meeting agenda/description"},
                 },
                 "required": ["title", "date", "start_time"],
             },
@@ -140,8 +141,37 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_task_list",
-            "description": "Get the list of tasks to complete.",
+            "name": "read_inbox",
+            "description": "List inbox messages, filtered by all/unread/unreplied.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Filter: 'all', 'unread', or 'unreplied'", "default": "all"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reply_message",
+            "description": "Reply to an inbox message. Reply must address the sender's concern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "ID of the message to reply to"},
+                    "reply": {"type": "string", "description": "Your reply text (min 20 chars, must address the sender's ask)"},
+                },
+                "required": ["message_id", "reply"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_personal_calendar",
+            "description": "Show personal (immovable) events that cannot be moved or deleted.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -178,6 +208,7 @@ TOOLS = [
                     "new_start_time": {"type": "string", "description": "New start time HH:MM (optional)"},
                     "new_duration_minutes": {"type": "integer", "description": "New duration in minutes (optional)"},
                     "new_attendees": {"type": "string", "description": "New comma-separated attendees list (optional)"},
+                    "new_description": {"type": "string", "description": "New description/agenda for the event"},
                 },
                 "required": ["title"],
             },
@@ -223,18 +254,23 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are a calendar personal assistant. You have access to tools to manage a calendar.
+SYSTEM_PROMPT = """You are a calendar personal assistant managing a team's calendar.
 
-Your goal is to complete ALL tasks on the task list. Start by calling get_task_list to see what needs to be done, then use the available tools to complete each task.
+Start by reading your inbox (read_inbox) and reviewing the calendar (list_events) to understand what needs to be done today.
 
 IMPORTANT workflow:
-1. First call get_task_list and get_constraints to understand the rules.
-2. BEFORE scheduling any meeting with someone, call get_contact_preferences(person) to discover their private constraints and preferences.
-3. Use check_availability before scheduling — don't guess times.
-4. When scheduling, respect HARD constraints (must obey) and SOFT constraints (preferences).
-5. After making changes, call check_constraint_violations to catch any violations.
-6. Periodically call get_task_list to check which tasks are still TODO.
-7. Think step by step about what tools to call and in what order."""
+1. Read your inbox to see pending requests from your boss and team.
+2. Review the calendar to understand the current schedule.
+3. BEFORE scheduling any meeting, call get_contact_preferences(person) to learn their constraints.
+4. Use check_availability before scheduling — don't guess times.
+5. Respect HARD constraints (must obey) and SOFT constraints (preferences).
+6. After making changes, call check_constraint_violations to verify.
+7. Keep checking your inbox — new messages may arrive while you work.
+8. When attendees decline a meeting, read their feedback and adjust your proposal.
+9. Personal events on the calendar are immovable — schedule work around them.
+10. Reply to messages that need responses.
+11. Inbox-driven requests are tracked in the inbox; if any task-style view omits them, use read_inbox as the source of truth.
+12. Think step by step about what tools to call and in what order."""
 
 
 async def run_agent():
@@ -262,7 +298,7 @@ async def run_agent():
             {"role": "user", "content": obs["output"]},
         ]
 
-        for step in range(30):
+        for step in range(60):
             print_separator()
             print(f"📍 STEP {step + 1}")
             print_separator()

@@ -40,6 +40,7 @@ class CalendarObservation(Observation):
     resolved_negotiations: dict[str, bool] = Field(default_factory=dict, description="Completed negotiations (scenario_id -> success)")
     unhandled_interrupts: list[str] = Field(default_factory=list, description="Interrupt messages not yet acted on")
     notifications_sent: list[dict] = Field(default_factory=list, description="All notifications sent so far")
+    inbox_snapshot: list[dict] = Field(default_factory=list, description="Inbox messages visible at current step")
     step_count: int = Field(default=0, description="Current step number in the episode")
 
 

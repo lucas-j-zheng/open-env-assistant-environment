@@ -190,18 +190,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_task_list",
-            "description": "Get the list of tasks to complete.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "check_availability",
             "description": "Check a person's availability on a given date. Shows their busy times from external commitments and free windows.",
             "parameters": {
@@ -252,24 +240,69 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_inbox",
+            "description": "List inbox messages, filtered by all/unread/unreplied.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Filter: 'all', 'unread', or 'unreplied'", "default": "all"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reply_message",
+            "description": "Reply to an inbox message. Reply must address the sender's concern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "ID of the message to reply to"},
+                    "reply": {"type": "string", "description": "Your reply text (min 20 chars, must address the sender's ask)"},
+                },
+                "required": ["message_id", "reply"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_personal_calendar",
+            "description": "Show personal (immovable) events that cannot be moved or deleted.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
-SYSTEM_PROMPT = """You are a calendar personal assistant. You have access to tools to manage a calendar.
+SYSTEM_PROMPT = """You are a calendar personal assistant managing a team's calendar.
 
-Your goal is to complete ALL tasks on the task list. Start by calling get_task_list to see what needs to be done, then use the available tools to complete each task.
+Start by reading your inbox (read_inbox) and reviewing the calendar (list_events) to understand what needs to be done today.
 
 IMPORTANT workflow:
-1. First call get_task_list and get_constraints to understand the general rules.
-2. BEFORE scheduling any meeting with someone, call get_contact_preferences(person) to discover their private constraints and preferences. Not all constraints are visible in get_constraints.
-3. Use check_availability before scheduling — don't guess times.
-4. When scheduling, respect HARD constraints (must obey) and SOFT constraints (preferences).
-5. After making changes, call check_constraint_violations to catch any violations.
-6. Periodically call get_task_list to check which tasks are still TODO.
-7. The "preferences_optimized" task requires soft constraints to be satisfied. If you see soft violations, fix them.
-8. Think step by step about what tools to call and in what order.
-9. When creating meetings, attendees may decline with feedback. Read their response carefully and adjust your next attempt (different duration, time, or format) to address their specific concern. Do not just retry the same parameters.
-10. Pay attention to policy changes announced via interrupts. Rules may change mid-session — tools and constraints that worked before may behave differently after an update. Re-check constraints after any policy announcement.
-11. If someone's availability changes, re-validate any meetings you already scheduled with that person."""
+1. Read your inbox to see pending requests from your boss and team.
+2. Review the calendar to understand the current schedule.
+3. BEFORE scheduling any meeting, call get_contact_preferences(person) to learn their constraints.
+4. Use check_availability before scheduling — don't guess times.
+5. Respect HARD constraints (must obey) and SOFT constraints (preferences).
+6. After making changes, call check_constraint_violations to verify.
+7. Keep checking your inbox — new messages may arrive while you work.
+8. When attendees decline a meeting, read their feedback and adjust your proposal.
+9. Personal events on the calendar are immovable — schedule work around them.
+10. Reply to messages that need responses.
+11. Inbox-driven requests are tracked in the inbox; if any task-style view omits them, use read_inbox as the source of truth.
+12. Think step by step about what tools to call and in what order.
+13. Pay attention to policy changes announced via interrupts. Rules may change mid-session.
+14. If someone's availability changes, re-validate any meetings you already scheduled with that person.
+15. Family may text mid-session about personal event changes. Re-check for new conflicts."""
 
 
 # --- Agent Logic ---
@@ -289,16 +322,20 @@ def _extract_interrupt(step: int, output: str) -> dict | None:
         return None
 
     interrupt_text = output.split("--- INTERRUPT ---", 1)[1].strip()
-    if step == 3 or "CEO" in interrupt_text:
+    if "CEO" in interrupt_text:
         key = "ceo_sync"
-    elif step == 7 or "unavailable Wednesday" in interrupt_text:
+    elif "unavailable Wednesday" in interrupt_text or "unavailable" in interrupt_text.lower() and "afternoon" in interrupt_text.lower():
         key = "availability_change"
-    elif step == 6 or "Lunch with Client" in interrupt_text:
+    elif "cancelled" in interrupt_text and ("Lunch" in interrupt_text or "slot is now free" in interrupt_text):
         key = "lunch_cancellation"
-    elif step == 9 or "Morning Sync" in interrupt_text:
+    elif "move" in interrupt_text.lower() and ("reschedule" in interrupt_text.lower() or "11:00" in interrupt_text):
         key = "morning_reschedule"
-    elif step == 12 or "description/agenda" in interrupt_text:
+    elif "description" in interrupt_text.lower() and "agenda" in interrupt_text.lower():
         key = "description_policy"
+    elif "inbox" in interrupt_text.lower() or "follow-up" in interrupt_text.lower():
+        key = "inbox_update"
+    elif "partner" in interrupt_text.lower() or "family" in interrupt_text.lower() or "dinner" in interrupt_text.lower():
+        key = "personal_event_change"
     else:
         key = f"interrupt_step_{step}"
 
@@ -368,7 +405,7 @@ async def run_agent():
         history = []  # full history for sliding window
         latest_state_summary = obs.get("state_summary", obs["output"])
 
-        for step in range(60):
+        for step in range(120):
             await broadcast({"type": "thinking", "step": step + 1})
 
             # Build messages: system + state summary + recent history
@@ -816,6 +853,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="task-item todo"><span class="flag-icon">○</span><div><strong>preferences_optimized</strong><div class="task-desc">Satisfy soft constraints/preferences</div></div></div>
       <div class="task-item todo"><span class="flag-icon">○</span><div><strong>availability_drift_handled</strong><div class="task-desc">[DYNAMIC] Re-validate after Bob availability change</div></div></div>
       <div class="task-item todo"><span class="flag-icon">○</span><div><strong>description_policy_met</strong><div class="task-desc">[DYNAMIC] All meetings comply with description policy</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>inbox_cleared</strong><div class="task-desc">Reply to all inbox messages</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>diplomatic_reply_sent</strong><div class="task-desc">Reply diplomatically to tough email</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>client_request_updated</strong><div class="task-desc">[DYNAMIC] Handle contradicting client message</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>work_life_conflicts_resolved</strong><div class="task-desc">Resolve personal vs work event conflicts</div></div></div>
+      <div class="task-item todo"><span class="flag-icon">○</span><div><strong>personal_update_handled</strong><div class="task-desc">[DYNAMIC] Adjust after personal event time change</div></div></div>
     </div>
   </div>
 </div>
@@ -838,16 +880,24 @@ const TASKS = [
   { flag: 'preferences_optimized', desc: 'Satisfy soft constraints/preferences' },
   { flag: 'availability_drift_handled', desc: '[DYNAMIC] Re-validate after Bob availability change' },
   { flag: 'description_policy_met', desc: '[DYNAMIC] All meetings comply with description policy' },
+  { flag: 'inbox_cleared', desc: 'Reply to all inbox messages' },
+  { flag: 'diplomatic_reply_sent', desc: 'Reply diplomatically to tough email' },
+  { flag: 'client_request_updated', desc: '[DYNAMIC] Handle contradicting client message' },
+  { flag: 'work_life_conflicts_resolved', desc: 'Resolve personal vs work event conflicts' },
+  { flag: 'personal_update_handled', desc: '[DYNAMIC] Adjust after personal event time change' },
 ];
 const INTERRUPTS = [
-  { key: 'ceo_sync', step: 3, label: 'Inject urgent CEO Sync at 15:00 today' },
-  { key: 'availability_change', step: 7, label: "Bob's Wednesday afternoons now blocked" },
-  { key: 'lunch_cancellation', step: 6, label: "Cancel 'Lunch with Client' and free 12:00-13:00 slot" },
-  { key: 'morning_reschedule', step: 9, label: "Request move: 'Morning Sync' to 11:00" },
-  { key: 'description_policy', step: 12, label: "HR: meetings >30min need description" },
+  { key: 'ceo_sync', step: null, label: 'Inject urgent CEO Sync at 15:00 today' },
+  { key: 'inbox_update', step: null, label: 'Contradicting follow-up message arrives' },
+  { key: 'availability_change', step: null, label: "Bob's Wednesday afternoons now blocked" },
+  { key: 'lunch_cancellation', step: null, label: "Cancel 'Lunch with Client' and free 12:00-13:00 slot" },
+  { key: 'morning_reschedule', step: null, label: "Request move: 'Morning Sync' to 11:00" },
+  { key: 'personal_event_change', step: null, label: 'Partner texts: personal event time changed' },
+  { key: 'description_policy', step: null, label: "HR: meetings >30min need description" },
 ];
 let firedInterrupts = new Set();
 const interruptMessages = new Map();
+const interruptFiredSteps = new Map();
 let interruptHistory = [];
 
 function addEvent(html, cls) {
@@ -892,12 +942,13 @@ function renderInterrupts(currentStep = 0) {
   const container = document.getElementById('interrupts');
   container.innerHTML = INTERRUPTS.map(item => {
     const fired = firedInterrupts.has(item.key);
-    const isCurrent = currentStep === item.step;
-    const cls = `${fired ? 'fired' : 'pending'} ${isCurrent ? 'current' : ''}`;
+    const firedStep = interruptFiredSteps.get(item.key);
+    const cls = `${fired ? 'fired' : 'pending'}`;
     const hoverText = interruptMessages.get(item.key) || '';
     const hoverAttr = hoverText ? ` title="${escapeHtml(hoverText)}"` : '';
+    const stepLabel = fired ? `Step ${firedStep}` : 'Pending';
     return `<div class="interrupt-item ${cls}">` +
-      `<span class="interrupt-step">Step ${item.step}</span>` +
+      `<span class="interrupt-step">${stepLabel}</span>` +
       `<span class="interrupt-label"${hoverAttr}>${item.label}</span>` +
       `</div>`;
   }).join('');
@@ -943,6 +994,7 @@ function connect() {
         feed.innerHTML = '';
         firedInterrupts = new Set();
         interruptMessages.clear();
+        interruptFiredSteps.clear();
         interruptHistory = [];
         const taskListHtml = TASKS.map((t, i) => `  ${i+1}. ${t.desc}`).join('\\n');
         addEvent(
@@ -990,6 +1042,7 @@ function connect() {
       case 'interrupt':
         firedInterrupts.add(data.interrupt_key);
         interruptMessages.set(data.interrupt_key, data.message);
+        interruptFiredSteps.set(data.interrupt_key, data.step);
         const meta = INTERRUPTS.find(x => x.key === data.interrupt_key);
         interruptHistory.push({
           step: data.step,
