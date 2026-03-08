@@ -54,46 +54,29 @@ class Config:
 
 
 SYSTEM_PROMPT = """\
-You are a calendar personal assistant. Respond ONLY with a JSON tool call.
+You are a calendar personal assistant. Respond with a JSON tool call.
 
 Format: {"tool": "tool_name", "args": {"key": "value"}}
 
-Available tools:
-- get_task_list: See tasks to complete (no args)
-- list_events: List events for a date (date: "today"/"tomorrow"/day name/YYYY-MM-DD)
-- create_event: Create event (title, date, start_time "HH:MM", duration_minutes, attendees "Alice,Bob", description)
-- delete_event: Delete event by title (title)
-- edit_event: Edit event (title, optional: new_title/new_date/new_start_time/new_duration_minutes/new_attendees/new_description)
-- find_free_slots: Find open time slots (date, duration_minutes)
-- check_conflicts: Check for overlapping events (date)
-- resolve_conflict: Move an event to new time (event_title, new_start_time "HH:MM")
-- send_notification: Notify someone (to, message)
-- check_availability: Check person's busy/free times (person, date)
-- get_constraints: Get public scheduling rules (no args)
-- get_contact_preferences: Get person's private preferences and constraints (person)
-- check_constraint_violations: Audit calendar for all violations (no args)
-- read_inbox: Read inbox messages (status: "all"/"unread"/"unreplied")
-- reply_message: Reply to inbox message (message_id, reply — must be 20+ chars and address the concern)
-- check_personal_calendar: Show personal/immovable events (no args)
+Tools:
+- get_task_list (no args)
+- list_events (date)
+- create_event (title, date, start_time, duration_minutes, attendees, description)
+- delete_event (title)
+- edit_event (title, new_title/new_date/new_start_time/new_duration_minutes/new_attendees/new_description)
+- find_free_slots (date, duration_minutes)
+- check_conflicts (date)
+- resolve_conflict (event_title, new_start_time)
+- send_notification (to, message)
+- check_availability (person, date)
+- get_constraints (no args)
+- get_contact_preferences (person)
+- check_constraint_violations (no args)
+- read_inbox (status: "all"/"unread"/"unreplied")
+- reply_message (message_id, reply)
+- check_personal_calendar (no args)
 
-Strategy:
-1. Call get_task_list to see what needs doing
-2. Call get_constraints for public rules, then get_contact_preferences for each person
-3. Call read_inbox to check for messages that need replies
-4. Call check_personal_calendar to see immovable personal events
-5. Call check_availability before scheduling any meeting
-6. Handle INTERRUPT messages immediately when they appear
-7. When someone DECLINES a meeting, adjust and re-create with their feedback
-8. After changes, call check_constraint_violations to verify
-9. Meetings >30 min need a description (if policy is active, use edit_event to add)
-
-IMPORTANT:
-- Personal events CANNOT be moved — work events must accommodate them
-- Some tasks are hidden in inbox messages — read your inbox
-- Attendees may negotiate/decline — adapt to their feedback
-- Availability can change mid-episode — re-check after updates
-
-Output ONLY the JSON tool call, nothing else."""
+Respond with one JSON tool call."""
 
 
 def extract_tool_call(text: str) -> str:
