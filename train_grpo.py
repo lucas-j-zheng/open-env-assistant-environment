@@ -33,7 +33,7 @@ class Config:
     lora_alpha: int = 32
     max_seq_len: int = 2048
 
-    # GRPO (same seed per group — proper GRPO)
+    # GRPO (different seeds, cross-seed advantages)
     group_size: int = 3
     max_steps_per_episode: int = 40
 
@@ -231,25 +231,15 @@ def main():
     for it in range(1, cfg.num_iterations + 1):
         t0 = time.time()
 
-        # Phase 1: Rollout — same seed (proper GRPO), fallback to mixed seeds
+        # Phase 1: Rollout — different seed per episode
         FastLanguageModel.for_inference(model)
-        seed = random.randint(0, 100_000)
         group_rewards, group_trajs = [], []
 
         for _ in range(cfg.group_size):
+            seed = random.randint(0, 100_000)
             r, traj, n_steps = run_episode(model, tokenizer, seed, cfg, device)
             group_rewards.append(r)
             group_trajs.append(traj)
-
-        # If zero variance (all same reward), retry with different seeds
-        if np.std(group_rewards) < 1e-6:
-            print(f"    (same-seed gave identical rewards {group_rewards[0]:.3f}, retrying mixed seeds)")
-            group_rewards, group_trajs = [], []
-            for _ in range(cfg.group_size):
-                seed = random.randint(0, 100_000)
-                r, traj, n_steps = run_episode(model, tokenizer, seed, cfg, device)
-                group_rewards.append(r)
-                group_trajs.append(traj)
 
         # GRPO advantages
         mu = np.mean(group_rewards)
